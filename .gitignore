@@ -1,0 +1,19 @@
+# Local SQLite database
+*.db
+
+# Secrets (never commit credentials / server config)
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
