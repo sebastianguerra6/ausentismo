@@ -273,26 +273,70 @@ def render_weekly_team_report() -> None:
         c3.metric("People in my team", headcount)
         c4.metric("Locations", n_locations if use_location else "-")
 
+        st.markdown("**1. Enter the hours per row**")
         st.caption(
-            "Enter the **Approved Leave** and **Unplanned** hours per row. Counts and "
-            "weekly values recalculate automatically (1 day = 8 hours)."
+            "Type the Approved (Vacation) and Unplanned (Medical Leave, Personal Day) "
+            "hours. The query calculations below recalculate automatically."
         )
-        editable = df.drop(columns=["Lunes_Semana"], errors="ignore")
-        edited = st.data_editor(
-            editable,
+        input_cols = [
+            c
+            for c in (
+                "Unit",
+                "SubUnit",
+                "SubUnit_Description",
+                "Location",
+                "People_In_Unit",
+                "Business_Days",
+                "Approved_Hours",
+                "Not_Approved_Hours",
+            )
+            if c in df.columns
+        ]
+        editor_df = df[input_cols].copy()
+        edited_inputs = st.data_editor(
+            editor_df,
             use_container_width=True,
             hide_index=True,
-            disabled=[c for c in editable.columns if c not in ("Approved_Hours", "Not_Approved_Hours")],
+            disabled=[c for c in input_cols if c not in ("Approved_Hours", "Not_Approved_Hours")],
             column_config={
-                "Approved_Hours": st.column_config.NumberColumn("Approved Leave (hours)", min_value=0, step=8),
-                "Not_Approved_Hours": st.column_config.NumberColumn("Unplanned (hours)", min_value=0, step=8),
+                "Approved_Hours": st.column_config.NumberColumn("Approved (Vacations in hours)", min_value=0, step=8),
+                "Not_Approved_Hours": st.column_config.NumberColumn("Unplanned (Medical Leave, Personal Day)", min_value=0, step=8),
             },
             key="weekly_editor",
         )
 
-        edited = recompute_hours(edited, business_days)
-        st.caption("Preview with recalculated counts and weekly values:")
-        st.dataframe(edited, use_container_width=True, hide_index=True)
+        # Push edited hours back into the full frame, then run the query-style math:
+        #   Count   = Hours / 8
+        #   Hours   = Count * 8 (kept as entered)
+        #   Semana  = ROUND(Count / business_days, 1)  [0 when no business days]
+        full = df.drop(columns=["Lunes_Semana"], errors="ignore").copy()
+        for col in ("Approved_Hours", "Not_Approved_Hours"):
+            if col in edited_inputs.columns:
+                full[col] = edited_inputs[col].to_numpy()
+        edited = recompute_hours(full, business_days)
+
+        st.markdown("**2. Query calculations (counts, hours and weekly values)**")
+        result_cols = [
+            c
+            for c in (
+                "Unit",
+                "SubUnit",
+                "SubUnit_Description",
+                "Location",
+                "Business_Days",
+                "People_In_Unit",
+                "Attended_Count",
+                "Attended_Hours",
+                "Approved_Count",
+                "Approved_Hours",
+                "Approved_Semana",
+                "Not_Approved_Count",
+                "Not_Approved_Hours",
+                "Not_Approved_Semana",
+            )
+            if c in edited.columns
+        ]
+        st.dataframe(edited[result_cols], use_container_width=True, hide_index=True)
 
         if st.button("Save weekly report"):
             records = []
