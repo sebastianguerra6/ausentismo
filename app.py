@@ -1,12 +1,14 @@
-"""Absenteeism Hours Tracker.
+"""Absenteeism & Work From Office (WFO) tracker.
 
-A Streamlit app with two tools:
-  1. Manual Entry: a user enters approved and disapproved hours; the app computes
-     metrics and stores each record in a SQL (SQLite) database.
-  2. Weekly Team Report: pulls last week's Attendance from SQL Server
-     ([Bogota_GBS_NS].[dbo].[vwAttendance] + Holidays), computes approved /
-     not-approved hours by Unit & SubUnit, lets the user adjust the approved
-     values, and saves it as the team's weekly report.
+Two manual-entry modules whose data is stored in SQL Server (Trusted Connection):
+  1. Absenteeism: Vicepresident, Unit, People in unit, planned / unplanned
+     approved leave and days affected, plus a comment. Computes the unplanned
+     percentage of the week.
+  2. Work From Office: expected vs actual attendance and a comment. Computes the
+     attendance percentage.
+
+Writing is gated by Active Directory group membership, checked via SQL Server's
+IS_MEMBER over the trusted connection.
 """
 
 from datetime import date
@@ -14,33 +16,15 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-import database as db
+import sqlserver
 
-# Maps the SQL Server query columns to the weekly_team_report table columns.
-WEEKLY_COLUMN_MAP = {
-    "Unit": "unit",
-    "SubUnit": "subunit",
-    "SubUnit_Description": "subunit_description",
-    "Location": "location",
-    "Business_Days": "business_days",
-    "People_In_Unit": "people_in_unit",
-    "Attended_Count": "attended_count",
-    "Attended_Hours": "attended_hours",
-    "Approved_Count": "approved_count",
-    "Approved_Hours": "approved_hours",
-    "Approved_Semana": "approved_semana",
-    "Not_Approved_Count": "not_approved_count",
-    "Not_Approved_Hours": "not_approved_hours",
-    "Not_Approved_Semana": "not_approved_semana",
-}
-
-HOURS_PER_DAY = 8
+ABSENTEEISM_COMMENTS = ["Vacation", "Medical Leave", "Personal Day", "Training", "Other"]
+WFO_COMMENTS = ["On site", "Remote - approved", "Transport issue", "Health", "Other"]
 
 SCOTIA_RED = "#EC111A"
 
 BRAND_CSS = f"""
 <style>
-    /* Scotiabank red top bar */
     .scotia-header {{
         background-color: {SCOTIA_RED};
         padding: 18px 24px;
@@ -59,7 +43,6 @@ BRAND_CSS = f"""
         font-size: 0.9rem;
         opacity: 0.95;
     }}
-    /* Buttons in Scotiabank red */
     div.stButton > button, div.stFormSubmitButton > button {{
         background-color: {SCOTIA_RED};
         color: #FFFFFF;
@@ -70,7 +53,6 @@ BRAND_CSS = f"""
         background-color: #C40E15;
         color: #FFFFFF;
     }}
-    /* Section divider accent */
     hr {{
         border-color: {SCOTIA_RED};
     }}
@@ -78,310 +60,205 @@ BRAND_CSS = f"""
 """
 
 
-def compute_metrics(approved: float, disapproved: float) -> dict:
-    """Return the derived metrics for a pair of hour inputs."""
-    total = approved + disapproved
-    approval_rate = (approved / total * 100) if total > 0 else 0.0
-    absenteeism_rate = (disapproved / total * 100) if total > 0 else 0.0
-    return {
-        "total_hours": round(total, 2),
-        "approval_rate": round(approval_rate, 2),
-        "absenteeism_rate": round(absenteeism_rate, 2),
-    }
+def unplanned_percentage(planned_days: int, unplanned_days: int) -> tuple[int, float]:
+    """Return (total_days_affected, unplanned_pct).
 
-
-def render_manual_entry() -> None:
-    """Tab 1: a single user enters approved / disapproved hours."""
-    with st.form("hours_form", clear_on_submit=False):
-        employee_name = st.text_input("Employee name", placeholder="e.g. John Doe")
-        record_date = st.date_input("Date", value=date.today())
-
-        col1, col2 = st.columns(2)
-        with col1:
-            approved_hours = st.number_input(
-                "Approved hours",
-                min_value=0.0,
-                step=0.5,
-                format="%.2f",
-            )
-        with col2:
-            disapproved_hours = st.number_input(
-                "Disapproved hours",
-                min_value=0.0,
-                step=0.5,
-                format="%.2f",
-            )
-
-        submitted = st.form_submit_button("Calculate & Save")
-
-    if submitted:
-        if not employee_name.strip():
-            st.error("Please enter the employee name.")
-        elif approved_hours == 0 and disapproved_hours == 0:
-            st.error("Please enter at least some hours before saving.")
-        else:
-            metrics = compute_metrics(approved_hours, disapproved_hours)
-
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Total hours", f"{metrics['total_hours']:.2f}")
-            m2.metric("Approval rate", f"{metrics['approval_rate']:.2f}%")
-            m3.metric("Absenteeism rate", f"{metrics['absenteeism_rate']:.2f}%")
-
-            new_id = db.insert_record(
-                employee_name=employee_name.strip(),
-                record_date=record_date,
-                approved_hours=approved_hours,
-                disapproved_hours=disapproved_hours,
-                total_hours=metrics["total_hours"],
-                approval_rate=metrics["approval_rate"],
-                absenteeism_rate=metrics["absenteeism_rate"],
-            )
-            st.success(f"Record saved to the database (ID #{new_id}).")
-
-    st.divider()
-    st.subheader("Saved records")
-
-    rows = db.fetch_records()
-    if rows:
-        df = pd.DataFrame([dict(row) for row in rows])
-        st.dataframe(df, use_container_width=True, hide_index=True)
-    else:
-        st.info("No records yet. Submit the form above to create the first one.")
-
-
-def recompute_hours(df: pd.DataFrame, business_days) -> pd.DataFrame:
-    """Recompute counts and weekly-normalized values from the (possibly edited)
-    Approved / Not-Approved hours. Keeps the SQL logic: 1 day = 8 hours and
-    *_Semana = count / business_days, rounded to 1 decimal.
+    total_days_affected = planned + unplanned
+    unplanned_pct = unplanned / total * 100 (0 when there are no affected days).
     """
-    out = df.copy()
-    try:
-        days = float(business_days) if business_days else 0.0
-    except (TypeError, ValueError):
-        days = 0.0
-
-    for hours_col, count_col, semana_col in (
-        ("Approved_Hours", "Approved_Count", "Approved_Semana"),
-        ("Not_Approved_Hours", "Not_Approved_Count", "Not_Approved_Semana"),
-    ):
-        if hours_col in out.columns:
-            hours = pd.to_numeric(out[hours_col], errors="coerce").fillna(0)
-            counts = hours / HOURS_PER_DAY
-            if count_col in out.columns:
-                out[count_col] = counts
-            if semana_col in out.columns:
-                out[semana_col] = (counts / days).round(1) if days > 0 else 0.0
-    return out
+    total = (planned_days or 0) + (unplanned_days or 0)
+    pct = round((unplanned_days or 0) / total * 100, 1) if total > 0 else 0.0
+    return total, pct
 
 
-def render_weekly_team_report() -> None:
-    """Tab 2: pull last week's Attendance for the signed-in leader's team, let the
-    leader enter approved-leave / unplanned hours, and save the weekly report.
-    """
-    import sqlserver
+def attendance_percentage(expected: int, actual: int) -> float:
+    """Return attendance_pct = actual / expected * 100 (0 when expected is 0)."""
+    return round((actual or 0) / expected * 100, 1) if expected and expected > 0 else 0.0
 
-    st.subheader("Weekly Team Report")
+
+def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> None:
+    st.subheader("Absenteeism")
     st.caption(
-        "Detects your Windows user, pulls last week's Attendance for your team "
-        "(Mon-Fri, Colombian holidays excluded) from SQL Server, and lets you enter "
-        "Approved Leave / Unplanned hours by Unit, SubUnit and location."
+        "Register planned and unplanned approved leave for a unit. The unplanned "
+        "percentage of the week is calculated over the total days affected."
     )
 
-    windows_user = sqlserver.current_windows_user()
-    st.info(f"Signed in as (Windows user): **{windows_user}**")
+    with st.form("absenteeism_form", clear_on_submit=False):
+        record_date = st.date_input("Date", value=date.today())
+        vicepresident = st.text_input("Vicepresident")
+        unit = st.text_input("Unit")
+        people_in_unit = st.number_input("People in unit", min_value=0, step=1)
 
+        st.markdown("**Planned approved leave**")
+        p1, p2 = st.columns(2)
+        with p1:
+            planned_leave = st.number_input("Planned approved leave (people)", min_value=0, step=1, key="planned_leave")
+        with p2:
+            planned_days = st.number_input("Days affected (planned)", min_value=0, step=1, key="planned_days")
+
+        st.markdown("**Unplanned approved leave**")
+        u1, u2 = st.columns(2)
+        with u1:
+            unplanned_leave = st.number_input("Unplanned approved leave (people)", min_value=0, step=1, key="unplanned_leave")
+        with u2:
+            unplanned_days = st.number_input("Days affected (unplanned)", min_value=0, step=1, key="unplanned_days")
+
+        comment = st.selectbox("Comment", options=ABSENTEEISM_COMMENTS)
+
+        submitted = st.form_submit_button("Calculate & Save", disabled=not can_write)
+
+    total_days, unplanned_pct = unplanned_percentage(int(planned_days), int(unplanned_days))
+    m1, m2 = st.columns(2)
+    m1.metric("Total days affected", total_days)
+    m2.metric("% Unplanned (week)", f"{unplanned_pct:.1f}%")
+
+    if submitted:
+        if not can_write:
+            st.error("You do not have permission to write.")
+        elif total_days == 0:
+            st.error("Please enter at least some days affected before saving.")
+        else:
+            try:
+                sqlserver.insert_absenteeism(
+                    record_date=record_date,
+                    vicepresident=vicepresident.strip(),
+                    unit=unit.strip(),
+                    people_in_unit=int(people_in_unit),
+                    planned_leave=int(planned_leave),
+                    planned_days_affected=int(planned_days),
+                    unplanned_leave=int(unplanned_leave),
+                    unplanned_days_affected=int(unplanned_days),
+                    total_days_affected=total_days,
+                    unplanned_pct=unplanned_pct,
+                    comment=comment.strip(),
+                    created_by=created_by,
+                    server=server,
+                )
+                st.success("Absenteeism record saved to SQL Server.")
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not save the record: {exc}")
+
+    st.divider()
+    st.subheader("Saved absenteeism records")
+    _render_history(sqlserver.fetch_absenteeism, server)
+
+
+def render_wfo(server: str | None, can_write: bool, created_by: str) -> None:
+    st.subheader("Work From Office (WFO)")
+    st.caption("Register how many people were expected and how many came. Attendance % is calculated.")
+
+    with st.form("wfo_form", clear_on_submit=False):
+        record_date = st.date_input("Date", value=date.today(), key="wfo_date")
+        c1, c2 = st.columns(2)
+        with c1:
+            expected = st.number_input("Expected (had to come)", min_value=0, step=1)
+        with c2:
+            actual = st.number_input("Actual (came)", min_value=0, step=1)
+        comment = st.selectbox("Comment", options=WFO_COMMENTS, key="wfo_comment")
+
+        submitted = st.form_submit_button("Calculate & Save", disabled=not can_write)
+
+    attendance_pct = attendance_percentage(int(expected), int(actual))
+    st.metric("Attendance %", f"{attendance_pct:.1f}%")
+
+    if submitted:
+        if not can_write:
+            st.error("You do not have permission to write.")
+        elif expected == 0:
+            st.error("Please enter the expected number of people before saving.")
+        else:
+            try:
+                sqlserver.insert_wfo(
+                    record_date=record_date,
+                    expected=int(expected),
+                    actual=int(actual),
+                    attendance_pct=attendance_pct,
+                    comment=comment.strip(),
+                    created_by=created_by,
+                    server=server,
+                )
+                st.success("WFO record saved to SQL Server.")
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not save the record: {exc}")
+
+    st.divider()
+    st.subheader("Saved WFO records")
+    _render_history(sqlserver.fetch_wfo, server)
+
+
+def _render_history(fetch_fn, server: str | None) -> None:
+    """Show a fetched history table, handling connection errors gracefully."""
+    try:
+        df = fetch_fn(server=server)
+    except Exception as exc:  # noqa: BLE001
+        st.info(f"Could not load saved records (check the SQL Server connection): {exc}")
+        return
+    if df is None or df.empty:
+        st.info("No records yet.")
+    else:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def main() -> None:
+    st.set_page_config(page_title="Absenteeism & WFO Tracker", page_icon="⏱️", layout="wide")
+
+    st.markdown(BRAND_CSS, unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="scotia-header">
+            <h1>Scotiabank | Absenteeism & WFO Tracker</h1>
+            <p>Register absenteeism and work-from-office attendance. Data is stored in SQL Server.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    windows_user = sqlserver.current_windows_domain_user()
     server = st.text_input(
         "SQL Server host",
         value=st.session_state.get("sqlserver_host", ""),
         placeholder="e.g. SQLPRD01 or SQLPRD01\\INSTANCE",
         help="Windows Authentication is used. Leave empty to use the configured default.",
     )
+    server = server or None
     if server:
         st.session_state["sqlserver_host"] = server
 
-    with st.expander("Team & schema setup", expanded=not st.session_state.get("att_columns")):
-        st.caption(
-            "Map the vwAttendance columns once. 'Discover columns' lists every "
-            "column so you can pick the manager and location ones."
-        )
-        if st.button("Discover vwAttendance columns"):
-            try:
-                with st.spinner("Reading vwAttendance schema ..."):
-                    st.session_state["att_columns"] = sqlserver.list_view_columns(server=server or None)
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Could not read the schema: {exc}")
+    # Ensure the tables exist and evaluate write permission (AD group membership).
+    init_error = None
+    try:
+        sqlserver.init_db(server=server)
+    except Exception as exc:  # noqa: BLE001
+        init_error = str(exc)
 
-        columns = st.session_state.get("att_columns", [])
-        options = ["(none)"] + columns
-        manager_col = st.selectbox(
-            "Manager / leader column (used to filter your team)",
-            options=options,
-            index=options.index(st.session_state["map_manager_col"])
-            if st.session_state.get("map_manager_col") in options
-            else 0,
-            help="The column in vwAttendance that stores each person's manager identifier.",
-        )
-        location_col = st.selectbox(
-            "Location column (optional)",
-            options=options,
-            index=options.index(st.session_state["map_location_col"])
-            if st.session_state.get("map_location_col") in options
-            else 0,
-        )
-        leader_value = st.text_input(
-            "My leader identifier value",
-            value=st.session_state.get("leader_value", windows_user),
-            help="Value to match in the manager column. Defaults to your Windows user.",
-        )
-        st.session_state["map_manager_col"] = manager_col
-        st.session_state["map_location_col"] = location_col
-        st.session_state["leader_value"] = leader_value
+    can_write = False
+    perm_error = None
+    write_group = sqlserver.get_write_group()
+    try:
+        can_write = sqlserver.can_write(server=server)
+    except Exception as exc:  # noqa: BLE001
+        perm_error = str(exc)
 
-    manager_col = st.session_state.get("map_manager_col", "(none)")
-    location_col = st.session_state.get("map_location_col", "(none)")
-    leader_value = st.session_state.get("leader_value", windows_user)
-    use_manager = manager_col not in (None, "(none)", "")
-    use_location = location_col not in (None, "(none)", "")
-
-    if st.button("Load last week's data from SQL Server"):
-        try:
-            with st.spinner("Querying [Bogota_GBS_NS] ..."):
-                df = sqlserver.fetch_weekly_team_report(
-                    server=server or None,
-                    manager_column=manager_col if use_manager else None,
-                    manager_value=leader_value if use_manager else None,
-                    location_column=location_col if use_location else None,
-                )
-            if df.empty:
-                st.warning("The query returned no rows for last week / your team.")
-            st.session_state["weekly_df"] = df
-        except Exception as exc:  # noqa: BLE001 - surface any connection/query error
-            st.error(f"Could not load data from SQL Server: {exc}")
-
-    df = st.session_state.get("weekly_df")
-    if df is None or df.empty:
-        st.info("Set up the mapping and load the data to build the weekly report.")
+    st.info(f"Signed in as (Windows user): **{windows_user}**")
+    if init_error:
+        st.warning(f"Could not verify/create the tables in SQL Server: {init_error}")
+    if not write_group:
+        st.warning(
+            "No AD write group is configured (`[auth] write_group` in secrets or "
+            "`AD_WRITE_GROUP`). The app is in read-only mode until it is set."
+        )
+    elif perm_error:
+        st.warning(f"Could not check AD group membership: {perm_error}. Read-only mode.")
+    elif can_write:
+        st.success(f"You are a member of **{write_group}**: you can save records.")
     else:
-        week_monday = str(df["Lunes_Semana"].iloc[0]) if "Lunes_Semana" in df else ""
-        business_days = df["Business_Days"].iloc[0] if "Business_Days" in df else None
-        headcount = int(df["People_In_Unit"].sum()) if "People_In_Unit" in df else 0
-        n_locations = df["Location"].nunique() if "Location" in df else 0
+        st.warning(f"You are not a member of **{write_group}**: read-only mode.")
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Week (Monday)", week_monday or "-")
-        c2.metric("Business days", f"{business_days:g}" if business_days is not None else "-")
-        c3.metric("People in my team", headcount)
-        c4.metric("Locations", n_locations if use_location else "-")
-
-        st.markdown("**1. Enter the hours per row**")
-        st.caption(
-            "Type the Approved (Vacation) and Unplanned (Medical Leave, Personal Day) "
-            "hours. The query calculations below recalculate automatically."
-        )
-        input_cols = [
-            c
-            for c in (
-                "Unit",
-                "SubUnit",
-                "SubUnit_Description",
-                "Location",
-                "People_In_Unit",
-                "Business_Days",
-                "Approved_Hours",
-                "Not_Approved_Hours",
-            )
-            if c in df.columns
-        ]
-        editor_df = df[input_cols].copy()
-        edited_inputs = st.data_editor(
-            editor_df,
-            use_container_width=True,
-            hide_index=True,
-            disabled=[c for c in input_cols if c not in ("Approved_Hours", "Not_Approved_Hours")],
-            column_config={
-                "Approved_Hours": st.column_config.NumberColumn("Approved (Vacations in hours)", min_value=0, step=8),
-                "Not_Approved_Hours": st.column_config.NumberColumn("Unplanned (Medical Leave, Personal Day)", min_value=0, step=8),
-            },
-            key="weekly_editor",
-        )
-
-        # Push edited hours back into the full frame, then run the query-style math:
-        #   Count   = Hours / 8
-        #   Hours   = Count * 8 (kept as entered)
-        #   Semana  = ROUND(Count / business_days, 1)  [0 when no business days]
-        full = df.drop(columns=["Lunes_Semana"], errors="ignore").copy()
-        for col in ("Approved_Hours", "Not_Approved_Hours"):
-            if col in edited_inputs.columns:
-                full[col] = edited_inputs[col].to_numpy()
-        edited = recompute_hours(full, business_days)
-
-        st.markdown("**2. Query calculations (counts, hours and weekly values)**")
-        result_cols = [
-            c
-            for c in (
-                "Unit",
-                "SubUnit",
-                "SubUnit_Description",
-                "Location",
-                "Business_Days",
-                "People_In_Unit",
-                "Attended_Count",
-                "Attended_Hours",
-                "Approved_Count",
-                "Approved_Hours",
-                "Approved_Semana",
-                "Not_Approved_Count",
-                "Not_Approved_Hours",
-                "Not_Approved_Semana",
-            )
-            if c in edited.columns
-        ]
-        st.dataframe(edited[result_cols], use_container_width=True, hide_index=True)
-
-        if st.button("Save weekly report"):
-            records = []
-            for _, row in edited.iterrows():
-                records.append({db_col: row.get(sql_col) for sql_col, db_col in WEEKLY_COLUMN_MAP.items()})
-            count = db.save_weekly_report(
-                week_monday=week_monday,
-                rows=records,
-                leader=leader_value if use_manager else windows_user,
-            )
-            st.success(f"Weekly report for {week_monday} saved ({count} rows).")
-
-    st.divider()
-    st.subheader("Saved weekly reports")
-    saved = db.fetch_weekly_reports()
-    if saved:
-        st.dataframe(
-            pd.DataFrame([dict(r) for r in saved]),
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.info("No weekly reports saved yet.")
-
-
-def main() -> None:
-    st.set_page_config(page_title="Absenteeism Hours Tracker", page_icon="⏱️", layout="wide")
-    db.init_db()
-
-    st.markdown(BRAND_CSS, unsafe_allow_html=True)
-    st.markdown(
-        """
-        <div class="scotia-header">
-            <h1>Scotiabank | Absenteeism Hours Tracker</h1>
-            <p>Track approved and disapproved hours and build the weekly team report.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    manual_tab, weekly_tab = st.tabs(["Manual Entry", "Weekly Team Report"])
-    with manual_tab:
-        render_manual_entry()
-    with weekly_tab:
-        render_weekly_team_report()
+    absenteeism_tab, wfo_tab = st.tabs(["Absenteeism", "Work From Office"])
+    with absenteeism_tab:
+        render_absenteeism(server, can_write, windows_user)
+    with wfo_tab:
+        render_wfo(server, can_write, windows_user)
 
 
 if __name__ == "__main__":

@@ -1,55 +1,57 @@
-# Absenteeism Hours Tracker
+# Absenteeism & WFO Tracker
 
-A Streamlit app with two tools, styled in Scotiabank red and white:
+A Streamlit app with two manual-entry modules, styled in Scotiabank red and white.
+All data is stored in **SQL Server** (`[Bogota_GBS_NS]`) using **Windows
+Authentication (Trusted Connection)**. Writing is gated by **Active Directory
+group membership**.
 
-1. **Manual Entry** — record approved/disapproved hours, compute metrics, and
-   store every entry in a local SQL (SQLite) database.
-2. **Weekly Team Report** — pull last week's Attendance from the corporate
-   SQL Server database `[Bogota_GBS_NS]`, compute approved / not-approved hours
-   by Unit and SubUnit, let the user adjust the approved values, and save it as
-   the team's weekly report.
+## Modules
 
-## Features
+### 1. Absenteeism
 
-### Manual Entry
+Inputs:
+- Vicepresident
+- Unit
+- People in unit
+- Planned approved leave (people) and Days affected (planned)
+- Unplanned approved leave (people) and Days affected (unplanned)
+- Comment
 
-- Two main inputs: **Approved hours** and **Disapproved hours** (entered by the user).
-- Extra inputs: employee name and date.
-- Calculated metrics:
-  - Total hours = approved + disapproved
-  - Approval rate (%) = approved / total
-  - Absenteeism rate (%) = disapproved / total
-- Each submission is saved to a SQLite database (`absenteeism.db`).
+Calculation:
+- `Total days affected = planned days affected + unplanned days affected`
+- `% Unplanned (week) = unplanned days affected / total days affected * 100`
+  (0 when there are no affected days)
 
-### Weekly Team Report
+Records are saved in `dbo.Absenteeism_Records`.
 
-- Detects the signed-in **Windows user** and scopes the data to that leader's team.
-- Source: `[Bogota_GBS_NS].[dbo].[vwAttendance]` + `[Bogota_GBS_NS].[dbo].[Holidays]`.
-- Range: last full week (Monday to Friday), Colombian holidays excluded, normalized
-  by real business days (`@dias`).
-- Shows team headcount and locations (from Attendance), per Unit and SubUnit:
-  people in unit, attended / approved (Vacation) / not-approved (Medical Leave,
-  Personal Day) counts, hours (x8), and weekly normalized values.
-- The leader enters **Approved Leave** and **Unplanned** hours per row; counts and
-  weekly values recalculate automatically (1 day = 8 hours).
-- Saved into the local SQLite table `weekly_team_report` (one report per week per leader).
+### 2. Work From Office (WFO)
 
-#### One-time schema mapping
+Inputs:
+- Expected (how many had to come)
+- Actual (how many came)
+- Comment
 
-Because `vwAttendance` column names vary, the app includes a **Team & schema setup**
-panel:
+Calculation:
+- `Attendance % = actual / expected * 100` (0 when expected is 0)
 
-1. Click **Discover vwAttendance columns** to list the available columns.
-2. Pick the **Manager / leader column** (used to filter your team) and, optionally,
-   the **Location column**.
-3. The **leader identifier value** defaults to your Windows user; change it if your
-   manager column stores a different identifier (e.g. an Snumber).
+Records are saved in `dbo.WFO_Records`.
+
+## Authorization (Active Directory group)
+
+- The app detects the Windows user via `os.environ["USERNAME"]` (with
+  `USERDOMAIN` for the `DOMAIN\user` form used in `CreatedBy`).
+- Because the connection is trusted, SQL Server knows the connected login.
+  Before allowing a write, the app runs `SELECT IS_MEMBER('DOMAIN\Group')`.
+- If the user is a member of the configured group, saving is enabled; otherwise
+  the app stays in read-only mode.
+- The group is configurable (not hardcoded): `[auth] write_group` in
+  `.streamlit/secrets.toml`, or the environment variable `AD_WRITE_GROUP`.
 
 ## Requirements
 
 - Python 3.10+
-- For the Weekly Team Report: an ODBC driver (e.g. **ODBC Driver 18 for SQL Server**)
-  and network access to the SQL Server using **Windows Authentication**.
+- An ODBC driver (e.g. **ODBC Driver 18 for SQL Server**).
+- Network access to the SQL Server using Windows Authentication.
 
 ## Setup
 
@@ -57,34 +59,35 @@ panel:
 pip install -r requirements.txt
 ```
 
+Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and set the
+SQL Server host and the AD write group.
+
 ## Run
 
 ```bash
 streamlit run app.py
 ```
 
-The app opens in your browser. The local database file `absenteeism.db` is
-created automatically on first run.
+## Configuration priority
 
-## SQL Server configuration (Weekly Team Report)
+Server / database / write group are read in this order:
 
-The Weekly Team Report connects to `[Bogota_GBS_NS]` with Windows Authentication.
-Set the server host in any of these ways (highest priority first):
-
-1. Type it in the app's "SQL Server host" field.
-2. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and set
-   `[sqlserver] server`.
-3. Environment variables `SQLSERVER_HOST` / `SQLSERVER_DATABASE`.
+1. The "SQL Server host" field in the app (for the host).
+2. `.streamlit/secrets.toml` (`[sqlserver] server`/`database`, `[auth] write_group`).
+3. Environment variables `SQLSERVER_HOST` / `SQLSERVER_DATABASE` / `AD_WRITE_GROUP`.
 
 ## Files
 
-- `app.py` — Streamlit UI, tabs, and calculations.
-- `database.py` — local SQLite data-access layer (tables, insert, fetch).
-- `sqlserver.py` — SQL Server connection + the weekly Attendance query.
+- `app.py` — Streamlit UI: the two modules, permission banner, calculations.
+- `sqlserver.py` — SQL Server data layer: connection, `IS_MEMBER` check, table
+  creation, insert/fetch for both modules.
 - `requirements.txt` — Python dependencies.
 
-## Switching the local database
+## Database tables
 
-The app uses SQLite locally so it works with no server. To move to MySQL or
-PostgreSQL, update `get_connection()` in `database.py` and adjust the SQL
-placeholders.
+Auto-created if missing (requires table-creation permission):
+
+- `dbo.Absenteeism_Records`
+- `dbo.WFO_Records`
+
+Both include `CreatedBy` (Windows user) and `CreatedAt` (server timestamp).
