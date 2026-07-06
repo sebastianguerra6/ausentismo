@@ -21,6 +21,27 @@ import sqlserver
 ABSENTEEISM_COMMENTS = ["Vacation", "Medical Leave", "Personal Day", "Training", "Other"]
 WFO_COMMENTS = ["On site", "Remote - approved", "Transport issue", "Health", "Other"]
 
+# Example values only - replace with the real ones once confirmed.
+VICEPRESIDENT_OPTIONS = [
+    "VP Operations",
+    "VP Compliance",
+    "VP Technology",
+    "VP Financial Crimes",
+    "Other",
+]
+UNIT_OPTIONS = [
+    "EDDU Regular",
+    "ADT",
+    "BI & Automations",
+    "NS Bog",
+    "Swat",
+    "Triage",
+    "Payment",
+    "MST",
+    "Others",
+    "Other",
+]
+
 SCOTIA_RED = "#EC111A"
 
 BRAND_CSS = f"""
@@ -85,8 +106,8 @@ def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> 
 
     with st.form("absenteeism_form", clear_on_submit=False):
         record_date = st.date_input("Date", value=date.today())
-        vicepresident = st.text_input("Vicepresident")
-        unit = st.text_input("Unit")
+        vicepresident = st.selectbox("Vicepresident", options=VICEPRESIDENT_OPTIONS)
+        unit = st.selectbox("Unit", options=UNIT_OPTIONS)
         people_in_unit = st.number_input("People in unit", min_value=0, step=1)
 
         st.markdown("**Planned approved leave**")
