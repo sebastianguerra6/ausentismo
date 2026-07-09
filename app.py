@@ -18,10 +18,25 @@ import streamlit as st
 
 import sqlserver
 
-ABSENTEEISM_COMMENTS = ["Vacation", "Medical Leave", "Personal Day", "Training", "Other"]
-WFO_COMMENTS = ["On site", "Remote - approved", "Transport issue", "Health", "Other"]
+WFO_REASONS = [
+    "Medical Appointment",
+    "Personal Emergency",
+    "Approved by Manager for specific reasons",
+    "Work-related (travel, off-site, training, etc)",
+    "Operational (weather, health isolation, suspension)",
+    "Unexcused Absence/Declined WFO",
+    "Other",
+]
 
 # Example values only - replace with the real ones once confirmed.
+LOCATION_OPTIONS = [
+    "Bogota",
+    "Medellin",
+    "Cali",
+    "Barranquilla",
+    "Remote",
+    "Other",
+]
 VICEPRESIDENT_OPTIONS = [
     "VP Operations",
     "VP Compliance",
@@ -77,36 +92,6 @@ BRAND_CSS = f"""
     hr {{
         border-color: {SCOTIA_RED};
     }}
-    .info-tooltip {{
-        position: relative;
-        display: inline-block;
-        cursor: help;
-        margin-left: 6px;
-        color: #444444;
-        font-weight: 600;
-    }}
-    .info-tooltip .info-tooltip-text {{
-        visibility: hidden;
-        opacity: 0;
-        transition: opacity 0.15s ease-in-out;
-        width: 300px;
-        background-color: #ffffff;
-        color: #111111;
-        text-align: left;
-        border: 1px solid #dddddd;
-        border-radius: 6px;
-        padding: 8px 10px;
-        position: absolute;
-        z-index: 1000;
-        top: 140%;
-        left: 0;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-        font-weight: 400;
-    }}
-    .info-tooltip:hover .info-tooltip-text {{
-        visibility: visible;
-        opacity: 1;
-    }}
 </style>
 """
 
@@ -122,9 +107,22 @@ def unplanned_percentage(planned_days: int, unplanned_days: int) -> tuple[int, f
     return total, pct
 
 
-def attendance_percentage(expected: int, actual: int) -> float:
-    """Return attendance_pct = actual / expected * 100 (0 when expected is 0)."""
-    return round((actual or 0) / expected * 100, 1) if expected and expected > 0 else 0.0
+ABSENCE_REFERENCE = [
+    {"Absence reason": "Absent (No present, no Call)", "When to use it?": "Absent without excuse", "Available in me@Scotiabank": "No", "Type of Absence": "Unplanned"},
+    {"Absence reason": "Called in Sick", "When to use it?": "Absent with medical excuse but without license", "Available in me@Scotiabank": "Yes", "Type of Absence": "Unplanned"},
+    {"Absence reason": "Permission", "When to use it?": "Permission given to the employee", "Available in me@Scotiabank": "No", "Type of Absence": "Unplanned"},
+    {"Absence reason": "Special day or personal day", "When to use it?": "Free day given", "Available in me@Scotiabank": "Yes", "Type of Absence": "Unplanned"},
+    {"Absence reason": "Medical License", "When to use it?": "License given by a doctor due to illness (less than 6 days)", "Available in me@Scotiabank": "Yes", "Type of Absence": "Unplanned"},
+    {"Absence reason": "Bereavement Leave", "When to use it?": "License due to bereavement", "Available in me@Scotiabank": "Yes", "Type of Absence": "Unplanned"},
+    {"Absence reason": "BCP", "When to use it?": "Time off due to BCP protocol activated", "Available in me@Scotiabank": "No", "Type of Absence": "Unplanned"},
+    {"Absence reason": "Vacation", "When to use it?": "Authorized Vacation: forecast and executed", "Available in me@Scotiabank": "Yes", "Type of Absence": "Planned"},
+    {"Absence reason": "Paternity Leave", "When to use it?": "License due to paternity", "Available in me@Scotiabank": "Yes", "Type of Absence": "Planned"},
+    {"Absence reason": "Marriage Leave", "When to use it?": "License due to marriage", "Available in me@Scotiabank": "Yes", "Type of Absence": "Planned"},
+    {"Absence reason": "Lactation", "When to use it?": "Time off due to lactation", "Available in me@Scotiabank": "No", "Type of Absence": "Planned"},
+    {"Absence reason": "Flex Summer", "When to use it?": "Free 2.5 hours on Friday due to flex summer", "Available in me@Scotiabank": "No", "Type of Absence": "Planned"},
+    {"Absence reason": "Authorized", "When to use it?": "Planned Absence that does not fit prior reason descriptions", "Available in me@Scotiabank": "No", "Type of Absence": "Planned"},
+    {"Absence reason": "Birthday", "When to use it?": "Free day due to birthday", "Available in me@Scotiabank": "Yes", "Type of Absence": "Planned"},
+]
 
 
 def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> None:
@@ -134,68 +132,109 @@ def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> 
         "percentage of the week is calculated over the total days affected."
     )
 
-    record_date = st.date_input("Date", value=date.today())
-    vicepresident = st.selectbox("Vicepresident", options=VICEPRESIDENT_OPTIONS)
-    unit = st.selectbox("Unit", options=UNIT_OPTIONS)
-    people_in_unit = st.number_input("People in unit", min_value=0, step=1)
-    low_headcount = people_in_unit < 20
-    if low_headcount:
-        st.warning(
-            "Please add a comment explaining why the reported people do not "
-            "reach 90% of the registered unit."
+    form_col, ref_col = st.columns([2, 1])
+
+    with ref_col:
+        st.markdown("**Absence reason reference**")
+        st.caption("Use it to know whether a reason is Planned or Unplanned.")
+        st.dataframe(
+            pd.DataFrame(ABSENCE_REFERENCE),
+            hide_index=True,
+            use_container_width=True,
         )
 
-    st.markdown(
-        '<b>Planned approved leave</b> '
-        '<span class="info-tooltip">(i)'
-        '<span class="info-tooltip-text">'
-        'Examples: Vacation, pre-approved PTO, training, scheduled appointment.'
-        '</span></span>',
-        unsafe_allow_html=True,
-    )
-    p1, p2 = st.columns(2)
-    with p1:
-        planned_leave = st.number_input("Planned approved leave (people)", min_value=0, step=1, key="planned_leave")
-    with p2:
-        planned_days = st.number_input("Days affected (planned)", min_value=0, step=1, key="planned_days")
+    with form_col:
+        record_date = st.date_input("Date", value=date.today())
+        location = st.selectbox("Location", options=LOCATION_OPTIONS)
+        unit = st.selectbox("Unit", options=UNIT_OPTIONS)
+        vicepresident = st.selectbox("Vicepresident", options=VICEPRESIDENT_OPTIONS)
+        people_in_unit = st.number_input("People in unit", min_value=0, step=1)
 
-    st.markdown(
-        '<b>Unplanned approved leave</b> '
-        '<span class="info-tooltip">(i)'
-        '<span class="info-tooltip-text">'
-        'Examples: Medical leave, personal day, emergency absence, unexpected incident.'
-        '</span></span>',
-        unsafe_allow_html=True,
-    )
-    u1, u2 = st.columns(2)
-    with u1:
-        unplanned_leave = st.number_input("Unplanned approved leave (people)", min_value=0, step=1, key="unplanned_leave")
-    with u2:
-        unplanned_days = st.number_input("Days affected (unplanned)", min_value=0, step=1, key="unplanned_days")
+        low_headcount = people_in_unit < 20
+        headcount_comment = ""
+        if low_headcount:
+            st.warning(
+                "Please add a comment explaining why the reported people do not "
+                "reach 90% of the registered unit."
+            )
+            headcount_comment = st.text_area(
+                "Comment (why the reported people do not reach 90% of the unit)",
+                key="headcount_comment",
+            )
 
-    comment = st.selectbox("Comment", options=ABSENTEEISM_COMMENTS)
+        p1, p2 = st.columns(2)
+        with p1:
+            planned_leave = st.number_input(
+                "Number of employees on planned leave",
+                min_value=0,
+                step=1,
+                key="planned_leave",
+                help="Number of employees who were on planned leave during the reported week.",
+            )
+        with p2:
+            planned_days = st.number_input(
+                "Days Impacted in total",
+                min_value=0,
+                step=1,
+                key="planned_days",
+                help="Total number of workdays impacted by planned employee absences during the previous week.",
+            )
+        st.caption("Days during the reported week")
 
-    submitted = st.button("Calculate & Save", disabled=not can_write, key="absenteeism_submit")
+        u1, u2 = st.columns(2)
+        with u1:
+            unplanned_leave = st.number_input(
+                "Number of employees on unplanned leave",
+                min_value=0,
+                step=1,
+                key="unplanned_leave",
+                help="Number of employees who were on unplanned leave during the reported week.",
+            )
+        with u2:
+            unplanned_days = st.number_input(
+                "Days Impacted in total",
+                min_value=0,
+                step=1,
+                key="unplanned_days",
+                help="Total number of workdays impacted by unplanned employee absences during the previous week.",
+            )
+        st.caption("Days during the reported week")
 
-    total_days, unplanned_pct = unplanned_percentage(int(planned_days), int(unplanned_days))
-    m1, m2 = st.columns(2)
-    m1.metric("Total days affected", total_days)
-    m2.metric("% Unplanned (week)", f"{unplanned_pct:.1f}%")
+        total_days, unplanned_pct = unplanned_percentage(int(planned_days), int(unplanned_days))
+
+        high_unplanned = unplanned_pct > 5
+        unplanned_comment = ""
+        if high_unplanned:
+            st.warning("Unplanned is above 5%. Please add a comment explaining why.")
+            unplanned_comment = st.text_area(
+                "Comments",
+                key="unplanned_comment",
+                help="Required only when the number of unplanned % is greater than 5%.",
+            )
+
+        m1, m2 = st.columns(2)
+        m1.metric("Total days affected", total_days)
+        m2.metric("% Unplanned (week)", f"{unplanned_pct:.1f}%")
+
+        submitted = st.button("Calculate & Save", disabled=not can_write, key="absenteeism_submit")
 
     if submitted:
         if not can_write:
             st.error("You do not have permission to write.")
-        elif people_in_unit < 20 and not comment.strip():
+        elif low_headcount and not headcount_comment.strip():
             st.error(
                 "Please add a comment explaining why the reported people do not "
                 "reach 90% of the registered unit."
             )
+        elif high_unplanned and not unplanned_comment.strip():
+            st.error("Please add a comment explaining why the unplanned percentage is above 5%.")
         elif total_days == 0:
             st.error("Please enter at least some days affected before saving.")
         else:
             try:
                 sqlserver.insert_absenteeism(
                     record_date=record_date,
+                    location=location.strip(),
                     vicepresident=vicepresident.strip(),
                     unit=unit.strip(),
                     people_in_unit=int(people_in_unit),
@@ -205,7 +244,8 @@ def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> 
                     unplanned_days_affected=int(unplanned_days),
                     total_days_affected=total_days,
                     unplanned_pct=unplanned_pct,
-                    comment=comment.strip(),
+                    headcount_comment=headcount_comment.strip(),
+                    unplanned_comment=unplanned_comment.strip(),
                     created_by=created_by,
                     server=server,
                 )
@@ -221,63 +261,67 @@ def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> 
 def render_wfo(server: str | None, can_write: bool, created_by: str) -> None:
     st.subheader("Work From Office (WFO)")
 
-    needs_wfo = st.radio(
-        "Do you need to report WFO?",
+    all_attended = st.radio(
+        "Did **all** required employees attend the office on every mandatory day during the reported week?",
         options=["Yes", "No"],
         index=None,
         horizontal=True,
-        key="wfo_needs",
+        key="wfo_all_attended",
+    )
+    st.caption(
+        '"Yes" is selected when the required WFO requirement is met for the '
+        "entire week with no exceptions."
     )
 
-    if needs_wfo == "No":
-        st.info("Thank you. 0 WFO hours will be registered.")
-        record_date = st.date_input("Date", value=date.today(), key="wfo_no_date")
-        if st.button("Register (0 WFO)", disabled=not can_write, key="wfo_register_zero"):
+    if all_attended == "Yes":
+        st.success("All required employees complied. 0 non-compliant employees will be reported.")
+        record_date = st.date_input("Date", value=date.today(), key="wfo_date_yes")
+        if st.button("Calculate & Save", disabled=not can_write, key="wfo_save_yes"):
             if not can_write:
                 st.error("You do not have permission to write.")
             else:
                 try:
                     sqlserver.insert_wfo(
                         record_date=record_date,
-                        expected=0,
-                        actual=0,
-                        attendance_pct=0.0,
-                        comment="No WFO required",
+                        all_compliant=True,
+                        non_compliant=0,
+                        reason="",
                         created_by=created_by,
                         server=server,
                     )
-                    st.success("Registered 0 WFO hours in SQL Server.")
+                    st.success("WFO record saved to SQL Server (0 non-compliant).")
                 except Exception as exc:  # noqa: BLE001
                     st.error(f"Could not save the record: {exc}")
-    elif needs_wfo == "Yes":
-        st.caption("Register how many people were expected and how many came. Attendance % is calculated.")
-        with st.form("wfo_form", clear_on_submit=False):
-            record_date = st.date_input("Date", value=date.today(), key="wfo_date")
-            c1, c2 = st.columns(2)
-            with c1:
-                expected = st.number_input("Expected (had to come)", min_value=0, step=1)
-            with c2:
-                actual = st.number_input("Actual (came)", min_value=0, step=1)
-            comment = st.selectbox("Comment", options=WFO_COMMENTS, key="wfo_comment")
 
-            submitted = st.form_submit_button("Calculate & Save", disabled=not can_write)
+    elif all_attended == "No":
+        st.info(
+            "Please note: Select \"No\" only for employees who were expected to comply "
+            "with the WFO requirement. Employees on vacation, sick leave, or other exempt "
+            "absences should not be included."
+        )
+        st.caption("If \"No\" is selected, the system will require users to provide the following information:")
 
-        attendance_pct = attendance_percentage(int(expected), int(actual))
-        st.metric("Attendance %", f"{attendance_pct:.1f}%")
+        record_date = st.date_input("Date", value=date.today(), key="wfo_date_no")
+        non_compliant = st.number_input(
+            "How many employees were non-compliant with the WFO requirement this week?",
+            min_value=1,
+            step=1,
+            key="wfo_non_compliant",
+        )
+        reason = st.selectbox("Select a Reason", options=WFO_REASONS, key="wfo_reason")
 
-        if submitted:
+        if st.button("Calculate & Save", disabled=not can_write, key="wfo_save_no"):
             if not can_write:
                 st.error("You do not have permission to write.")
-            elif expected == 0:
-                st.error("Please enter the expected number of people before saving.")
+            elif int(non_compliant) < 1:
+                st.error("Please enter how many employees were non-compliant.")
             else:
                 try:
                     sqlserver.insert_wfo(
                         record_date=record_date,
-                        expected=int(expected),
-                        actual=int(actual),
-                        attendance_pct=attendance_pct,
-                        comment=comment.strip(),
+                        all_compliant=False,
+                        non_compliant=int(non_compliant),
+                        reason=reason.strip(),
                         created_by=created_by,
                         server=server,
                     )

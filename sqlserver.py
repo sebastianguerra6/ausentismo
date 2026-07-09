@@ -127,6 +127,7 @@ IF OBJECT_ID('dbo.Absenteeism_Records', 'U') IS NULL
 CREATE TABLE dbo.Absenteeism_Records (
     Id                     INT IDENTITY(1,1) PRIMARY KEY,
     RecordDate             DATE           NOT NULL,
+    Location               NVARCHAR(200)  NULL,
     Vicepresident          NVARCHAR(200)  NULL,
     Unit                   NVARCHAR(200)  NULL,
     PeopleInUnit           INT            NULL,
@@ -136,7 +137,8 @@ CREATE TABLE dbo.Absenteeism_Records (
     UnplannedDaysAffected  INT            NULL,
     TotalDaysAffected      INT            NULL,
     UnplannedPct           FLOAT          NULL,
-    Comment                NVARCHAR(1000) NULL,
+    HeadcountComment       NVARCHAR(1000) NULL,
+    UnplannedComment       NVARCHAR(1000) NULL,
     CreatedBy              NVARCHAR(200)  NULL,
     CreatedAt              DATETIME       NOT NULL DEFAULT GETDATE()
 );
@@ -145,14 +147,13 @@ CREATE TABLE dbo.Absenteeism_Records (
 _CREATE_WFO = """
 IF OBJECT_ID('dbo.WFO_Records', 'U') IS NULL
 CREATE TABLE dbo.WFO_Records (
-    Id             INT IDENTITY(1,1) PRIMARY KEY,
-    RecordDate     DATE           NOT NULL,
-    Expected       INT            NULL,
-    Actual         INT            NULL,
-    AttendancePct  FLOAT          NULL,
-    Comment        NVARCHAR(1000) NULL,
-    CreatedBy      NVARCHAR(200)  NULL,
-    CreatedAt      DATETIME       NOT NULL DEFAULT GETDATE()
+    Id                 INT IDENTITY(1,1) PRIMARY KEY,
+    RecordDate         DATE           NOT NULL,
+    AllCompliant       BIT            NULL,
+    NonCompliantCount  INT            NULL,
+    Reason             NVARCHAR(1000) NULL,
+    CreatedBy          NVARCHAR(200)  NULL,
+    CreatedAt          DATETIME       NOT NULL DEFAULT GETDATE()
 );
 """
 
@@ -175,6 +176,7 @@ def init_db(server: str | None = None, database: str | None = None) -> None:
 
 def insert_absenteeism(
     record_date,
+    location: str,
     vicepresident: str,
     unit: str,
     people_in_unit: int,
@@ -184,7 +186,8 @@ def insert_absenteeism(
     unplanned_days_affected: int,
     total_days_affected: int,
     unplanned_pct: float,
-    comment: str,
+    headcount_comment: str,
+    unplanned_comment: str,
     created_by: str,
     server: str | None = None,
     database: str | None = None,
@@ -196,12 +199,13 @@ def insert_absenteeism(
         cursor.execute(
             """
             INSERT INTO dbo.Absenteeism_Records (
-                RecordDate, Vicepresident, Unit, PeopleInUnit,
+                RecordDate, Location, Vicepresident, Unit, PeopleInUnit,
                 PlannedLeave, PlannedDaysAffected, UnplannedLeave, UnplannedDaysAffected,
-                TotalDaysAffected, UnplannedPct, Comment, CreatedBy
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                TotalDaysAffected, UnplannedPct, HeadcountComment, UnplannedComment, CreatedBy
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             record_date,
+            location,
             vicepresident,
             unit,
             people_in_unit,
@@ -211,7 +215,8 @@ def insert_absenteeism(
             unplanned_days_affected,
             total_days_affected,
             unplanned_pct,
-            comment,
+            headcount_comment,
+            unplanned_comment,
             created_by,
         )
         conn.commit()
@@ -236,10 +241,9 @@ def fetch_absenteeism(server: str | None = None, database: str | None = None) ->
 
 def insert_wfo(
     record_date,
-    expected: int,
-    actual: int,
-    attendance_pct: float,
-    comment: str,
+    all_compliant: bool,
+    non_compliant: int,
+    reason: str,
     created_by: str,
     server: str | None = None,
     database: str | None = None,
@@ -251,14 +255,13 @@ def insert_wfo(
         cursor.execute(
             """
             INSERT INTO dbo.WFO_Records (
-                RecordDate, Expected, Actual, AttendancePct, Comment, CreatedBy
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                RecordDate, AllCompliant, NonCompliantCount, Reason, CreatedBy
+            ) VALUES (?, ?, ?, ?, ?)
             """,
             record_date,
-            expected,
-            actual,
-            attendance_pct,
-            comment,
+            1 if all_compliant else 0,
+            non_compliant,
+            reason,
             created_by,
         )
         conn.commit()
