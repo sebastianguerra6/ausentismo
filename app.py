@@ -166,41 +166,70 @@ def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> 
 
 def render_wfo(server: str | None, can_write: bool, created_by: str) -> None:
     st.subheader("Work From Office (WFO)")
-    st.caption("Register how many people were expected and how many came. Attendance % is calculated.")
 
-    with st.form("wfo_form", clear_on_submit=False):
-        record_date = st.date_input("Date", value=date.today(), key="wfo_date")
-        c1, c2 = st.columns(2)
-        with c1:
-            expected = st.number_input("Expected (had to come)", min_value=0, step=1)
-        with c2:
-            actual = st.number_input("Actual (came)", min_value=0, step=1)
-        comment = st.selectbox("Comment", options=WFO_COMMENTS, key="wfo_comment")
+    needs_wfo = st.radio(
+        "Do you need to report WFO?",
+        options=["Yes", "No"],
+        index=None,
+        horizontal=True,
+        key="wfo_needs",
+    )
 
-        submitted = st.form_submit_button("Calculate & Save", disabled=not can_write)
+    if needs_wfo == "No":
+        st.info("Thank you. 0 WFO hours will be registered.")
+        record_date = st.date_input("Date", value=date.today(), key="wfo_no_date")
+        if st.button("Register (0 WFO)", disabled=not can_write, key="wfo_register_zero"):
+            if not can_write:
+                st.error("You do not have permission to write.")
+            else:
+                try:
+                    sqlserver.insert_wfo(
+                        record_date=record_date,
+                        expected=0,
+                        actual=0,
+                        attendance_pct=0.0,
+                        comment="No WFO required",
+                        created_by=created_by,
+                        server=server,
+                    )
+                    st.success("Registered 0 WFO hours in SQL Server.")
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Could not save the record: {exc}")
+    elif needs_wfo == "Yes":
+        st.caption("Register how many people were expected and how many came. Attendance % is calculated.")
+        with st.form("wfo_form", clear_on_submit=False):
+            record_date = st.date_input("Date", value=date.today(), key="wfo_date")
+            c1, c2 = st.columns(2)
+            with c1:
+                expected = st.number_input("Expected (had to come)", min_value=0, step=1)
+            with c2:
+                actual = st.number_input("Actual (came)", min_value=0, step=1)
+            comment = st.selectbox("Comment", options=WFO_COMMENTS, key="wfo_comment")
 
-    attendance_pct = attendance_percentage(int(expected), int(actual))
-    st.metric("Attendance %", f"{attendance_pct:.1f}%")
+            submitted = st.form_submit_button("Calculate & Save", disabled=not can_write)
 
-    if submitted:
-        if not can_write:
-            st.error("You do not have permission to write.")
-        elif expected == 0:
-            st.error("Please enter the expected number of people before saving.")
-        else:
-            try:
-                sqlserver.insert_wfo(
-                    record_date=record_date,
-                    expected=int(expected),
-                    actual=int(actual),
-                    attendance_pct=attendance_pct,
-                    comment=comment.strip(),
-                    created_by=created_by,
-                    server=server,
-                )
-                st.success("WFO record saved to SQL Server.")
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Could not save the record: {exc}")
+        attendance_pct = attendance_percentage(int(expected), int(actual))
+        st.metric("Attendance %", f"{attendance_pct:.1f}%")
+
+        if submitted:
+            if not can_write:
+                st.error("You do not have permission to write.")
+            elif expected == 0:
+                st.error("Please enter the expected number of people before saving.")
+            else:
+                try:
+                    sqlserver.insert_wfo(
+                        record_date=record_date,
+                        expected=int(expected),
+                        actual=int(actual),
+                        attendance_pct=attendance_pct,
+                        comment=comment.strip(),
+                        created_by=created_by,
+                        server=server,
+                    )
+                    st.success("WFO record saved to SQL Server.")
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Could not save the record: {exc}")
 
     st.divider()
     st.subheader("Saved WFO records")
