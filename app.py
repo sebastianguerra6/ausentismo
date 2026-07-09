@@ -77,6 +77,36 @@ BRAND_CSS = f"""
     hr {{
         border-color: {SCOTIA_RED};
     }}
+    .info-tooltip {{
+        position: relative;
+        display: inline-block;
+        cursor: help;
+        margin-left: 6px;
+        color: #444444;
+        font-weight: 600;
+    }}
+    .info-tooltip .info-tooltip-text {{
+        visibility: hidden;
+        opacity: 0;
+        transition: opacity 0.15s ease-in-out;
+        width: 300px;
+        background-color: #ffffff;
+        color: #111111;
+        text-align: left;
+        border: 1px solid #dddddd;
+        border-radius: 6px;
+        padding: 8px 10px;
+        position: absolute;
+        z-index: 1000;
+        top: 140%;
+        left: 0;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+        font-weight: 400;
+    }}
+    .info-tooltip:hover .info-tooltip-text {{
+        visibility: visible;
+        opacity: 1;
+    }}
 </style>
 """
 
@@ -110,14 +140,28 @@ def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> 
         unit = st.selectbox("Unit", options=UNIT_OPTIONS)
         people_in_unit = st.number_input("People in unit", min_value=0, step=1)
 
-        st.markdown("**Planned approved leave**")
+        st.markdown(
+            '<b>Planned approved leave</b> '
+            '<span class="info-tooltip">(i)'
+            '<span class="info-tooltip-text">'
+            'Examples: Vacation, pre-approved PTO, training, scheduled appointment.'
+            '</span></span>',
+            unsafe_allow_html=True,
+        )
         p1, p2 = st.columns(2)
         with p1:
             planned_leave = st.number_input("Planned approved leave (people)", min_value=0, step=1, key="planned_leave")
         with p2:
             planned_days = st.number_input("Days affected (planned)", min_value=0, step=1, key="planned_days")
 
-        st.markdown("**Unplanned approved leave**")
+        st.markdown(
+            '<b>Unplanned approved leave</b> '
+            '<span class="info-tooltip">(i)'
+            '<span class="info-tooltip-text">'
+            'Examples: Medical leave, personal day, emergency absence, unexpected incident.'
+            '</span></span>',
+            unsafe_allow_html=True,
+        )
         u1, u2 = st.columns(2)
         with u1:
             unplanned_leave = st.number_input("Unplanned approved leave (people)", min_value=0, step=1, key="unplanned_leave")
