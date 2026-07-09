@@ -96,14 +96,20 @@ BRAND_CSS = f"""
 """
 
 
-def unplanned_percentage(planned_days: int, unplanned_days: int) -> tuple[int, float]:
+def unplanned_percentage(
+    total_headcount: int, planned_days: int, unplanned_days: int
+) -> tuple[int, float]:
     """Return (total_days_affected, unplanned_pct).
 
     total_days_affected = planned + unplanned
-    unplanned_pct = unplanned / total * 100 (0 when there are no affected days).
+    unplanned_pct = (Days Affected (Unplanned) / 5) / (Total Headcount - Days Affected (Planned)) * 100
+    (Days Impacted are divided by 5 to convert them into person-week equivalents.
+    Returns 0 when the denominator is not positive.)
     """
     total = (planned_days or 0) + (unplanned_days or 0)
-    pct = round((unplanned_days or 0) / total * 100, 1) if total > 0 else 0.0
+    denominator = (total_headcount or 0) - (planned_days or 0)
+    unplanned_equivalent = (unplanned_days or 0) / 5
+    pct = round(unplanned_equivalent / denominator * 100, 1) if denominator > 0 else 0.0
     return total, pct
 
 
@@ -200,16 +206,18 @@ def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> 
             )
         st.caption("Days during the reported week")
 
-        total_days, unplanned_pct = unplanned_percentage(int(planned_days), int(unplanned_days))
+        total_days, unplanned_pct = unplanned_percentage(
+            int(people_in_unit), int(planned_days), int(unplanned_days)
+        )
 
-        high_unplanned = unplanned_pct > 5
+        high_unplanned = unplanned_pct > 3
         unplanned_comment = ""
         if high_unplanned:
-            st.warning("Unplanned is above 5%. Please add a comment explaining why.")
+            st.warning("Unplanned is above 3%. Please add a comment explaining why.")
             unplanned_comment = st.text_area(
                 "Comments",
                 key="unplanned_comment",
-                help="Required only when the number of unplanned % is greater than 5%.",
+                help="Required only when the number of unplanned % is greater than 3%.",
             )
 
         m1, m2 = st.columns(2)
@@ -227,7 +235,7 @@ def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> 
                 "reach 90% of the registered unit."
             )
         elif high_unplanned and not unplanned_comment.strip():
-            st.error("Please add a comment explaining why the unplanned percentage is above 5%.")
+            st.error("Please add a comment explaining why the unplanned percentage is above 3%.")
         elif total_days == 0:
             st.error("Please enter at least some days affected before saving.")
         else:
