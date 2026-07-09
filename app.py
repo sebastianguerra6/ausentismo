@@ -134,43 +134,48 @@ def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> 
         "percentage of the week is calculated over the total days affected."
     )
 
-    with st.form("absenteeism_form", clear_on_submit=False):
-        record_date = st.date_input("Date", value=date.today())
-        vicepresident = st.selectbox("Vicepresident", options=VICEPRESIDENT_OPTIONS)
-        unit = st.selectbox("Unit", options=UNIT_OPTIONS)
-        people_in_unit = st.number_input("People in unit", min_value=0, step=1)
-
-        st.markdown(
-            '<b>Planned approved leave</b> '
-            '<span class="info-tooltip">(i)'
-            '<span class="info-tooltip-text">'
-            'Examples: Vacation, pre-approved PTO, training, scheduled appointment.'
-            '</span></span>',
-            unsafe_allow_html=True,
+    record_date = st.date_input("Date", value=date.today())
+    vicepresident = st.selectbox("Vicepresident", options=VICEPRESIDENT_OPTIONS)
+    unit = st.selectbox("Unit", options=UNIT_OPTIONS)
+    people_in_unit = st.number_input("People in unit", min_value=0, step=1)
+    low_headcount = people_in_unit < 20
+    if low_headcount:
+        st.warning(
+            "Please add a comment explaining why the reported people do not "
+            "reach 90% of the registered unit."
         )
-        p1, p2 = st.columns(2)
-        with p1:
-            planned_leave = st.number_input("Planned approved leave (people)", min_value=0, step=1, key="planned_leave")
-        with p2:
-            planned_days = st.number_input("Days affected (planned)", min_value=0, step=1, key="planned_days")
 
-        st.markdown(
-            '<b>Unplanned approved leave</b> '
-            '<span class="info-tooltip">(i)'
-            '<span class="info-tooltip-text">'
-            'Examples: Medical leave, personal day, emergency absence, unexpected incident.'
-            '</span></span>',
-            unsafe_allow_html=True,
-        )
-        u1, u2 = st.columns(2)
-        with u1:
-            unplanned_leave = st.number_input("Unplanned approved leave (people)", min_value=0, step=1, key="unplanned_leave")
-        with u2:
-            unplanned_days = st.number_input("Days affected (unplanned)", min_value=0, step=1, key="unplanned_days")
+    st.markdown(
+        '<b>Planned approved leave</b> '
+        '<span class="info-tooltip">(i)'
+        '<span class="info-tooltip-text">'
+        'Examples: Vacation, pre-approved PTO, training, scheduled appointment.'
+        '</span></span>',
+        unsafe_allow_html=True,
+    )
+    p1, p2 = st.columns(2)
+    with p1:
+        planned_leave = st.number_input("Planned approved leave (people)", min_value=0, step=1, key="planned_leave")
+    with p2:
+        planned_days = st.number_input("Days affected (planned)", min_value=0, step=1, key="planned_days")
 
-        comment = st.selectbox("Comment", options=ABSENTEEISM_COMMENTS)
+    st.markdown(
+        '<b>Unplanned approved leave</b> '
+        '<span class="info-tooltip">(i)'
+        '<span class="info-tooltip-text">'
+        'Examples: Medical leave, personal day, emergency absence, unexpected incident.'
+        '</span></span>',
+        unsafe_allow_html=True,
+    )
+    u1, u2 = st.columns(2)
+    with u1:
+        unplanned_leave = st.number_input("Unplanned approved leave (people)", min_value=0, step=1, key="unplanned_leave")
+    with u2:
+        unplanned_days = st.number_input("Days affected (unplanned)", min_value=0, step=1, key="unplanned_days")
 
-        submitted = st.form_submit_button("Calculate & Save", disabled=not can_write)
+    comment = st.selectbox("Comment", options=ABSENTEEISM_COMMENTS)
+
+    submitted = st.button("Calculate & Save", disabled=not can_write, key="absenteeism_submit")
 
     total_days, unplanned_pct = unplanned_percentage(int(planned_days), int(unplanned_days))
     m1, m2 = st.columns(2)
@@ -180,6 +185,11 @@ def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> 
     if submitted:
         if not can_write:
             st.error("You do not have permission to write.")
+        elif people_in_unit < 20 and not comment.strip():
+            st.error(
+                "Please add a comment explaining why the reported people do not "
+                "reach 90% of the registered unit."
+            )
         elif total_days == 0:
             st.error("Please enter at least some days affected before saving.")
         else:
