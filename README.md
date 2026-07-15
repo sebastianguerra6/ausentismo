@@ -2,50 +2,44 @@
 
 A Streamlit app with two manual-entry modules, styled in Scotiabank red and white.
 All data is stored in **SQL Server** (`[Bogota_GBS_NS]`) using **Windows
-Authentication (Trusted Connection)**. Writing is gated by **Active Directory
-group membership**.
+Authentication (Trusted Connection)**. Read/write permissions are enforced by
+SQL Server for the connected Windows user; there is no application-level
+authorization.
+
+Both modules write to a single table: **`dbo.Attendance_Absenteeism_Report`**.
 
 ## Modules
 
 ### 1. Absenteeism
 
 Inputs:
-- Vicepresident
-- Unit
-- People in unit
-- Planned approved leave (people) and Days affected (planned)
-- Unplanned approved leave (people) and Days affected (unplanned)
-- Comment
+- Report week (date)
+- Leader
+- Location
+- Team
+- Total Headcount
+- Headcount comments (required only when the alignment % is below 90%)
+- Number of employees on planned leave and Days Impacted (planned)
+- Number of employees on unplanned leave and Days Impacted (unplanned)
+- Comments (required only when % Unplanned is above 3%)
 
-Calculation:
-- `Total days affected = planned days affected + unplanned days affected`
-- `% Unplanned (week) = unplanned days affected / total days affected * 100`
-  (0 when there are no affected days)
-
-Records are saved in `dbo.Absenteeism_Records`.
+Calculations:
+- `Total days affected = planned days impacted + unplanned days impacted`
+- `% Unplanned (week) = (Days Impacted Unplanned / 5) / (Total Headcount - Days Impacted Planned) * 100`
+  (0 when the denominator is not positive)
+- `Headcount Alignment % = Total Headcount / official unit headcount * 100`
+  — computed from a separate source base matched by unit id. Access to that
+  base is pending, so this is left empty (NULL) for now.
 
 ### 2. Work From Office (WFO)
 
-Inputs:
-- Expected (how many had to come)
-- Actual (how many came)
-- Comment
-
-Calculation:
-- `Attendance % = actual / expected * 100` (0 when expected is 0)
-
-Records are saved in `dbo.WFO_Records`.
-
-## Authorization (Active Directory group)
-
-- The app detects the Windows user via `os.environ["USERNAME"]` (with
-  `USERDOMAIN` for the `DOMAIN\user` form used in `CreatedBy`).
-- Because the connection is trusted, SQL Server knows the connected login.
-  Before allowing a write, the app runs `SELECT IS_MEMBER('DOMAIN\Group')`.
-- If the user is a member of the configured group, saving is enabled; otherwise
-  the app stays in read-only mode.
-- The group is configurable (not hardcoded): `[auth] write_group` in
-  `.streamlit/secrets.toml`, or the environment variable `AD_WRITE_GROUP`.
+Flow:
+- Identity fields (report week, Leader, Location, Team, Total Headcount).
+- Question: "Did all required employees attend the office on every mandatory day
+  during the reported week?"
+  - **Yes** → 0 non-compliant employees are reported.
+  - **No** → capture how many were non-compliant and up to 5 comments
+    (`WFO_Comment1..5`).
 
 ## Requirements
 
@@ -60,7 +54,7 @@ pip install -r requirements.txt
 ```
 
 Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and set the
-SQL Server host and the AD write group.
+SQL Server host and database.
 
 ## Run
 
@@ -70,24 +64,28 @@ streamlit run app.py
 
 ## Configuration priority
 
-Server / database / write group are read in this order:
+Server / database are read in this order:
 
 1. The "SQL Server host" field in the app (for the host).
-2. `.streamlit/secrets.toml` (`[sqlserver] server`/`database`, `[auth] write_group`).
-3. Environment variables `SQLSERVER_HOST` / `SQLSERVER_DATABASE` / `AD_WRITE_GROUP`.
+2. `.streamlit/secrets.toml` (`[sqlserver] server` / `database`).
+3. Environment variables `SQLSERVER_HOST` / `SQLSERVER_DATABASE`.
 
 ## Files
 
-- `app.py` — Streamlit UI: the two modules, permission banner, calculations.
-- `sqlserver.py` — SQL Server data layer: connection, `IS_MEMBER` check, table
-  creation, insert/fetch for both modules.
+- `app.py` — Streamlit UI: the two modules and calculations.
+- `sqlserver.py` — SQL Server data layer: connection, table bootstrap, and
+  insert/fetch for both modules.
 - `requirements.txt` — Python dependencies.
 
-## Database tables
+## Database table
 
-Auto-created if missing (requires table-creation permission):
+`dbo.Attendance_Absenteeism_Report` is auto-created if missing (requires
+table-creation permission). If the table already exists without a date column,
+the app tries to add a `Report_Week DATE` column (requires ALTER permission):
 
-- `dbo.Absenteeism_Records`
-- `dbo.WFO_Records`
+```sql
+ALTER TABLE dbo.Attendance_Absenteeism_Report ADD Report_Week DATE NULL;
+```
 
-Both include `CreatedBy` (Windows user) and `CreatedAt` (server timestamp).
+Absenteeism rows leave the WFO columns NULL; WFO rows store 0 in the required
+absenteeism numeric columns.

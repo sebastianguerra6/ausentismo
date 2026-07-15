@@ -2,16 +2,13 @@
 
 All persistence lives in SQL Server (``[Bogota_GBS_NS]``) and uses Windows
 Authentication (Trusted Connection) through pyodbc. Because the connection is
-trusted, the SQL Server login is the Windows user running the app.
-
-Authorization: before allowing a write, the app checks whether the current
-Windows user belongs to a configurable Active Directory group, using the native
-``IS_MEMBER('DOMAIN\\Group')`` function over the same trusted connection.
+trusted, the SQL Server login is the Windows user running the app, and SQL
+Server itself enforces read/write permissions for that user.
 
 Configuration (priority order):
   1. Arguments passed to ``get_connection``.
-  2. Streamlit secrets ``[sqlserver] server`` / ``database`` and ``[auth] write_group``.
-  3. Environment variables ``SQLSERVER_HOST`` / ``SQLSERVER_DATABASE`` / ``AD_WRITE_GROUP``.
+  2. Streamlit secrets ``[sqlserver] server`` / ``database``.
+  3. Environment variables ``SQLSERVER_HOST`` / ``SQLSERVER_DATABASE``.
   4. Defaults (``localhost`` / ``Bogota_GBS_NS``).
 """
 
@@ -44,11 +41,6 @@ def _read_secret(section: str, key: str) -> str | None:
         return st.secrets.get(section, {}).get(key)  # type: ignore[no-any-return]
     except Exception:
         return None
-
-
-def get_write_group() -> str | None:
-    """Return the configured AD group allowed to write, or None if not set."""
-    return _read_secret("auth", "write_group") or os.environ.get("AD_WRITE_GROUP")
 
 
 def _pick_driver() -> str:
@@ -93,29 +85,6 @@ def get_connection(server: str | None = None, database: str | None = None):
         "TrustServerCertificate=yes;"
     )
     return pyodbc.connect(conn_str)
-
-
-# ---------------------------------------------------------------------------
-# Authorization
-# ---------------------------------------------------------------------------
-
-def can_write(server: str | None = None, database: str | None = None) -> bool:
-    """Return True only if the current trusted login is a member of the
-    configured AD write group. Returns False when the group is not configured
-    or the membership check does not resolve to a member.
-    """
-    group = get_write_group()
-    if not group:
-        return False
-    conn = get_connection(server=server, database=database)
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT IS_MEMBER(?)", group)
-        row = cursor.fetchone()
-        # IS_MEMBER returns 1 (member), 0 (not), or NULL (group not valid).
-        return bool(row and row[0] == 1)
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------

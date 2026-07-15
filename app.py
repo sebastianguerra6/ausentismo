@@ -9,8 +9,8 @@ Two manual-entry modules that both write to a single SQL Server table
   2. Work From Office: whether all required employees attended, how many were
      non-compliant, and up to five comments.
 
-Writing is gated by Active Directory group membership, checked via SQL Server's
-IS_MEMBER over the trusted connection.
+Read/write permissions are enforced by SQL Server for the trusted Windows user
+(the account running the app); there is no application-level authorization.
 """
 
 from datetime import date
@@ -138,7 +138,7 @@ def render_identity(prefix: str) -> tuple[object, str, str, str, int]:
     return report_week, leader, location, team, int(total_headcount)
 
 
-def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> None:
+def render_absenteeism(server: str | None, created_by: str) -> None:
     st.subheader("Absenteeism")
     st.caption(
         "Register planned and unplanned approved leave for a team. The unplanned "
@@ -250,12 +250,10 @@ def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> 
         m1.metric("Total days affected", total_days)
         m2.metric("% Unplanned (week)", f"{unplanned_pct:.1f}%")
 
-        submitted = st.button("Calculate & Save", disabled=not can_write, key="absenteeism_submit")
+        submitted = st.button("Calculate & Save", key="absenteeism_submit")
 
     if submitted:
-        if not can_write:
-            st.error("You do not have permission to write.")
-        elif low_alignment and not headcount_comment.strip():
+        if low_alignment and not headcount_comment.strip():
             st.error(
                 "Please add a comment explaining why the reported people do not "
                 "reach 90% of the registered unit."
@@ -290,7 +288,7 @@ def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> 
     _render_history(sqlserver.fetch_absenteeism, server)
 
 
-def render_wfo(server: str | None, can_write: bool, created_by: str) -> None:
+def render_wfo(server: str | None, created_by: str) -> None:
     st.subheader("Work From Office (WFO)")
 
     report_week, leader, location, team, total_headcount = render_identity("wfo")
@@ -309,25 +307,22 @@ def render_wfo(server: str | None, can_write: bool, created_by: str) -> None:
 
     if all_attended == "Yes":
         st.success("All required employees complied. 0 non-compliant employees will be reported.")
-        if st.button("Calculate & Save", disabled=not can_write, key="wfo_save_yes"):
-            if not can_write:
-                st.error("You do not have permission to write.")
-            else:
-                try:
-                    sqlserver.insert_wfo(
-                        report_week=report_week,
-                        leader=leader.strip(),
-                        location=location.strip(),
-                        team=team.strip(),
-                        total_headcount=int(total_headcount),
-                        all_attended=True,
-                        num_unattended=0,
-                        comments=[],
-                        server=server,
-                    )
-                    st.success("WFO record saved to SQL Server (0 non-compliant).")
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"Could not save the record: {exc}")
+        if st.button("Calculate & Save", key="wfo_save_yes"):
+            try:
+                sqlserver.insert_wfo(
+                    report_week=report_week,
+                    leader=leader.strip(),
+                    location=location.strip(),
+                    team=team.strip(),
+                    total_headcount=int(total_headcount),
+                    all_attended=True,
+                    num_unattended=0,
+                    comments=[],
+                    server=server,
+                )
+                st.success("WFO record saved to SQL Server (0 non-compliant).")
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not save the record: {exc}")
 
     elif all_attended == "No":
         st.info(
@@ -356,11 +351,9 @@ def render_wfo(server: str | None, can_write: bool, created_by: str) -> None:
                 st.text_input(f"WFO comment {i + 1}", key=f"wfo_comment_{i + 1}")
             )
 
-        if st.button("Calculate & Save", disabled=not can_write, key="wfo_save_no"):
+        if st.button("Calculate & Save", key="wfo_save_no"):
             filled = [c.strip() for c in comments if c.strip()]
-            if not can_write:
-                st.error("You do not have permission to write.")
-            elif int(non_compliant) < 1:
+            if int(non_compliant) < 1:
                 st.error("Please enter how many employees were non-compliant.")
             elif not filled:
                 st.error("Please add at least one comment explaining the non-compliance.")
@@ -424,41 +417,23 @@ def main() -> None:
     if server:
         st.session_state["sqlserver_host"] = server
 
-    # Ensure the tables exist and evaluate write permission (AD group membership).
+    # Ensure the report table exists. SQL Server enforces the write permission
+    # of the trusted Windows user, so no application-level gating is needed.
     init_error = None
     try:
         sqlserver.init_db(server=server)
     except Exception as exc:  # noqa: BLE001
         init_error = str(exc)
 
-    can_write = False
-    perm_error = None
-    write_group = sqlserver.get_write_group()
-    try:
-        can_write = sqlserver.can_write(server=server)
-    except Exception as exc:  # noqa: BLE001
-        perm_error = str(exc)
-
     st.info(f"Signed in as (Windows user): **{windows_user}**")
     if init_error:
-        st.warning(f"Could not verify/create the tables in SQL Server: {init_error}")
-    if not write_group:
-        st.warning(
-            "No AD write group is configured (`[auth] write_group` in secrets or "
-            "`AD_WRITE_GROUP`). The app is in read-only mode until it is set."
-        )
-    elif perm_error:
-        st.warning(f"Could not check AD group membership: {perm_error}. Read-only mode.")
-    elif can_write:
-        st.success(f"You are a member of **{write_group}**: you can save records.")
-    else:
-        st.warning(f"You are not a member of **{write_group}**: read-only mode.")
+        st.warning(f"Could not verify/create the table in SQL Server: {init_error}")
 
     absenteeism_tab, wfo_tab = st.tabs(["Absenteeism", "Work From Office"])
     with absenteeism_tab:
-        render_absenteeism(server, can_write, windows_user)
+        render_absenteeism(server, windows_user)
     with wfo_tab:
-        render_wfo(server, can_write, windows_user)
+        render_wfo(server, windows_user)
 
 
 if __name__ == "__main__":
