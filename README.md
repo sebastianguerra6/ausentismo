@@ -80,12 +80,9 @@ Server / database are read in this order:
 ## Database table
 
 `dbo.Attendance_Absenteeism_Report` is auto-created if missing (requires
-table-creation permission). If the table already exists without a date column,
-the app tries to add a `Report_Week DATE` column (requires ALTER permission):
+table-creation permission). The date column is `Report_Date` (NOT NULL) and is
+always stored as the Monday of the reported week.
 
-```sql
-ALTER TABLE dbo.Attendance_Absenteeism_Report ADD Report_Week DATE NULL;
-```
-
-Absenteeism rows leave the WFO columns NULL; WFO rows store 0 in the required
-absenteeism numeric columns.
+Each submission is a single row: the absenteeism data is always present, and the
+WFO columns are filled only when the WFO module applies to that location
+(otherwise they stay NULL).
