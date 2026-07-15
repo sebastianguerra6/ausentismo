@@ -158,7 +158,7 @@ def render_identity(prefix: str) -> tuple[date, str, str, str, int]:
     return monday_of_week(report_date), leader, location, team, int(total_headcount)
 
 
-def render_absenteeism(server: str | None) -> None:
+def render_absenteeism(server: str | None, created_by: str) -> None:
     st.subheader("Absenteeism")
     st.caption(
         "Register planned and unplanned approved leave for a team. The unplanned "
@@ -295,6 +295,7 @@ def render_absenteeism(server: str | None) -> None:
                     days_impacted_unplanned=int(unplanned_days),
                     num_employees_unplanned_leave=int(unplanned_leave),
                     absenteeism_comments=unplanned_comment.strip(),
+                    created_by=created_by,
                     server=server,
                 )
                 st.success("Absenteeism record saved to SQL Server.")
@@ -306,7 +307,7 @@ def render_absenteeism(server: str | None) -> None:
     _render_history(sqlserver.fetch_absenteeism, server)
 
 
-def render_wfo(server: str | None) -> None:
+def render_wfo(server: str | None, created_by: str) -> None:
     st.subheader("Work From Office (WFO)")
 
     report_date, leader, location, team, total_headcount = render_identity("wfo")
@@ -380,6 +381,7 @@ def render_wfo(server: str | None) -> None:
                     total_headcount=int(total_headcount),
                     all_attended=all_attended == "Yes",
                     num_unattended=num_unattended,
+                    created_by=created_by,
                     comments=comments,
                     server=server,
                 )
@@ -444,9 +446,9 @@ def main() -> None:
 
     absenteeism_tab, wfo_tab = st.tabs(["Absenteeism", "Work From Office"])
     with absenteeism_tab:
-        render_absenteeism(server)
+        render_absenteeism(server, windows_user)
     with wfo_tab:
-        render_wfo(server)
+        render_wfo(server, windows_user)
 
 
 if __name__ == "__main__":

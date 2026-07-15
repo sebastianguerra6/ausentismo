@@ -122,17 +122,27 @@ CREATE TABLE dbo.Attendance_Absenteeism_Report (
     WFO_Comment3                   VARCHAR(500)    NULL,
     WFO_Comment4                   VARCHAR(500)    NULL,
     WFO_Comment5                   VARCHAR(500)    NULL,
+    Created_By                     VARCHAR(200)    NULL,
     CreatedAt                      DATETIME        NOT NULL DEFAULT GETDATE()
 );
 """
 
+# The business table may already exist without a Created_By column, so add it
+# when missing (only if the login has ALTER permission).
+_ENSURE_CREATED_BY = """
+IF OBJECT_ID('dbo.Attendance_Absenteeism_Report', 'U') IS NOT NULL
+   AND COL_LENGTH('dbo.Attendance_Absenteeism_Report', 'Created_By') IS NULL
+    ALTER TABLE dbo.Attendance_Absenteeism_Report ADD Created_By VARCHAR(200) NULL;
+"""
+
 
 def init_db(server: str | None = None, database: str | None = None) -> None:
-    """Ensure the report table exists (no-op when it already does)."""
+    """Ensure the report table (and its Created_By column) exists."""
     conn = get_connection(server=server, database=database)
     try:
         cursor = conn.cursor()
         cursor.execute(_CREATE_REPORT)
+        cursor.execute(_ENSURE_CREATED_BY)
         conn.commit()
     finally:
         conn.close()
@@ -181,6 +191,7 @@ def insert_absenteeism(
     days_impacted_unplanned: float,
     num_employees_unplanned_leave: int,
     absenteeism_comments: str,
+    created_by: str,
     server: str | None = None,
     database: str | None = None,
 ) -> None:
@@ -195,8 +206,8 @@ def insert_absenteeism(
                 Headcount_Alignment_Pct, Headcount_Comments,
                 Days_Impacted_Planned, Num_Employees_Planned_Leave,
                 Days_Impacted_Unplanned, Num_Employees_Unplanned_Leave,
-                Absenteeism_Comments
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                Absenteeism_Comments, Created_By
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             report_date,
             leader,
@@ -210,6 +221,7 @@ def insert_absenteeism(
             days_impacted_unplanned,
             num_employees_unplanned_leave,
             absenteeism_comments,
+            created_by,
         )
         conn.commit()
     finally:
@@ -241,6 +253,7 @@ def insert_wfo(
     total_headcount: int,
     all_attended: bool,
     num_unattended: int,
+    created_by: str,
     comments: list[str] | None = None,
     server: str | None = None,
     database: str | None = None,
@@ -262,8 +275,9 @@ def insert_wfo(
                 Days_Impacted_Planned, Num_Employees_Planned_Leave,
                 Days_Impacted_Unplanned, Num_Employees_Unplanned_Leave,
                 WFO_All_Attended_Flag, Num_WFO_Unattended,
-                WFO_Comment1, WFO_Comment2, WFO_Comment3, WFO_Comment4, WFO_Comment5
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                WFO_Comment1, WFO_Comment2, WFO_Comment3, WFO_Comment4, WFO_Comment5,
+                Created_By
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             report_date,
             leader,
@@ -281,6 +295,7 @@ def insert_wfo(
             padded[2],
             padded[3],
             padded[4],
+            created_by,
         )
         conn.commit()
     finally:
