@@ -22,6 +22,7 @@ import sqlserver
 
 # Example values only - replace with the real ones once confirmed.
 LOCATION_OPTIONS = [
+    "Canada",
     "Bogota",
     "Medellin",
     "Cali",
@@ -29,6 +30,11 @@ LOCATION_OPTIONS = [
     "Remote",
     "Other",
 ]
+
+# Locations/countries whose people must also report WFO. This will be driven by
+# the by-country headcount source once access is granted; for now Canada is set
+# as an example of a location that has WFO access.
+WFO_ALLOWED_LOCATIONS = {"Canada"}
 LEADER_OPTIONS = [
     "VP Operations",
     "VP Compliance",
@@ -129,13 +135,13 @@ def monday_of_week(d: date) -> date:
 
 
 def can_use_wfo(location: str) -> bool:
-    """Whether the current person/location is allowed to report WFO.
+    """Whether the current person/location has WFO access.
 
-    This will be driven by the by-country headcount source (access pending).
-    Until then everyone is allowed, so the WFO Save button stays enabled.
-    Return False here (per user/location) to disable the WFO Save button.
+    When True, the WFO section is shown and must be filled together with the
+    absenteeism data. This will be driven by the by-country headcount source
+    once access is granted (see ``WFO_ALLOWED_LOCATIONS`` for the example).
     """
-    return True
+    return location in WFO_ALLOWED_LOCATIONS
 
 
 def render_identity(prefix: str) -> tuple[date, str, str, str, int]:
@@ -158,11 +164,11 @@ def render_identity(prefix: str) -> tuple[date, str, str, str, int]:
     return monday_of_week(report_date), leader, location, team, int(total_headcount)
 
 
-def render_absenteeism(server: str | None, created_by: str) -> None:
-    st.subheader("Absenteeism")
+def render_report(server: str | None, created_by: str) -> None:
+    st.subheader("Weekly report")
     st.caption(
-        "Register planned and unplanned approved leave for a team. The unplanned "
-        "percentage of the week is calculated over the total days affected."
+        "Register the team's absenteeism. If your location has WFO access, the "
+        "WFO section is mandatory and must be filled in the same submission."
     )
 
     form_col, ref_col = st.columns([2, 1])
@@ -177,7 +183,8 @@ def render_absenteeism(server: str | None, created_by: str) -> None:
         )
 
     with form_col:
-        report_date, leader, location, team, total_headcount = render_identity("abs")
+        report_date, leader, location, team, total_headcount = render_identity("rep")
+        wfo_required = can_use_wfo(location)
 
         # Headcount alignment vs the official unit headcount (from the source
         # base). Access is pending, so this is None for now.
@@ -270,7 +277,58 @@ def render_absenteeism(server: str | None, created_by: str) -> None:
         m1.metric("Total days affected", total_days)
         m2.metric("% Unplanned (week)", f"{unplanned_pct:.1f}%")
 
-        submitted = st.button("Calculate & Save", key="absenteeism_submit")
+        # ---- WFO section (mandatory when the location has WFO access) --------
+        wfo_answer = None
+        wfo_num_unattended = 0
+        wfo_comments: list[str] = []
+
+        if wfo_required:
+            st.divider()
+            st.markdown("**Work From Office (WFO)**")
+            st.caption("Your location has WFO access, so this section is mandatory.")
+            wfo_answer = st.radio(
+                "Did **all** required employees attend the office on every mandatory day during the reported week?",
+                options=["Yes", "No"],
+                index=None,
+                horizontal=True,
+                key="wfo_all_attended",
+            )
+            st.caption(
+                '"Yes" is selected when the required WFO requirement is met for the '
+                "entire week with no exceptions."
+            )
+
+            if wfo_answer == "Yes":
+                st.success("All required employees complied. 0 non-compliant employees will be reported.")
+            elif wfo_answer == "No":
+                st.info(
+                    "Please note: Select \"No\" only for employees who were expected to comply "
+                    "with the WFO requirement. Employees on vacation, sick leave, or other exempt "
+                    "absences should not be included."
+                )
+                st.caption("If \"No\" is selected, the system will require the following information:")
+                non_compliant = st.number_input(
+                    "How many employees were non-compliant with the WFO requirement this week?",
+                    min_value=1,
+                    step=1,
+                    key="wfo_non_compliant",
+                )
+                wfo_num_unattended = int(non_compliant)
+                num_boxes = min(wfo_num_unattended, 5)
+                st.caption(
+                    "Add a comment/reason per non-compliant employee (up to 5)."
+                    if wfo_num_unattended <= 5
+                    else "More than 5 non-compliant employees: only the first 5 comments are stored."
+                )
+                for i in range(num_boxes):
+                    value = st.text_input(f"WFO comment {i + 1}", key=f"wfo_comment_{i + 1}")
+                    if value.strip():
+                        wfo_comments.append(value.strip())
+        else:
+            st.divider()
+            st.caption("WFO reporting is not required for this location.")
+
+        submitted = st.button("Calculate & Save", key="report_submit")
 
     if submitted:
         if low_alignment and not headcount_comment.strip():
@@ -280,6 +338,12 @@ def render_absenteeism(server: str | None, created_by: str) -> None:
             )
         elif high_unplanned and not unplanned_comment.strip():
             st.error("Please add a comment explaining why the unplanned percentage is above 3%.")
+        elif wfo_required and wfo_answer is None:
+            st.error("Your location requires WFO. Please answer the WFO question before saving.")
+        elif wfo_required and wfo_answer == "No" and wfo_num_unattended < 1:
+            st.error("Please enter how many employees were non-compliant.")
+        elif wfo_required and wfo_answer == "No" and not wfo_comments:
+            st.error("Please add at least one comment explaining the non-compliance.")
         else:
             try:
                 sqlserver.insert_absenteeism(
@@ -298,99 +362,30 @@ def render_absenteeism(server: str | None, created_by: str) -> None:
                     created_by=created_by,
                     server=server,
                 )
-                st.success("Absenteeism record saved to SQL Server.")
+                if wfo_required:
+                    sqlserver.insert_wfo(
+                        report_date=report_date,
+                        leader=leader.strip(),
+                        location=location.strip(),
+                        team=team.strip(),
+                        total_headcount=int(total_headcount),
+                        all_attended=wfo_answer == "Yes",
+                        num_unattended=wfo_num_unattended,
+                        created_by=created_by,
+                        comments=wfo_comments,
+                        server=server,
+                    )
+                    st.success("Absenteeism and WFO records saved to SQL Server.")
+                else:
+                    st.success("Absenteeism record saved to SQL Server.")
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Could not save the record: {exc}")
 
     st.divider()
-    st.subheader("Saved absenteeism records")
+    st.subheader("Saved records")
+    st.markdown("**Absenteeism**")
     _render_history(sqlserver.fetch_absenteeism, server)
-
-
-def render_wfo(server: str | None, created_by: str) -> None:
-    st.subheader("Work From Office (WFO)")
-
-    report_date, leader, location, team, total_headcount = render_identity("wfo")
-
-    # Only people/locations allowed by the by-country headcount source may save
-    # WFO. Access is pending, so the button is enabled by default for now.
-    allowed = can_use_wfo(location)
-    if not allowed:
-        st.info("You are not part of the group allowed to report WFO for this location.")
-
-    all_attended = st.radio(
-        "Did **all** required employees attend the office on every mandatory day during the reported week?",
-        options=["Yes", "No"],
-        index=None,
-        horizontal=True,
-        key="wfo_all_attended",
-    )
-    st.caption(
-        '"Yes" is selected when the required WFO requirement is met for the '
-        "entire week with no exceptions."
-    )
-
-    num_unattended = 0
-    comments: list[str] = []
-
-    if all_attended == "Yes":
-        st.success("All required employees complied. 0 non-compliant employees will be reported.")
-    elif all_attended == "No":
-        st.info(
-            "Please note: Select \"No\" only for employees who were expected to comply "
-            "with the WFO requirement. Employees on vacation, sick leave, or other exempt "
-            "absences should not be included."
-        )
-        st.caption("If \"No\" is selected, the system will require the following information:")
-        non_compliant = st.number_input(
-            "How many employees were non-compliant with the WFO requirement this week?",
-            min_value=1,
-            step=1,
-            key="wfo_non_compliant",
-        )
-        num_unattended = int(non_compliant)
-        num_boxes = min(num_unattended, 5)
-        st.caption(
-            "Add a comment/reason per non-compliant employee (up to 5)."
-            if num_unattended <= 5
-            else "More than 5 non-compliant employees: only the first 5 comments are stored."
-        )
-        for i in range(num_boxes):
-            value = st.text_input(f"WFO comment {i + 1}", key=f"wfo_comment_{i + 1}")
-            if value.strip():
-                comments.append(value.strip())
-
-    submitted = st.button("Calculate & Save", disabled=not allowed, key="wfo_submit")
-
-    if submitted:
-        if not allowed:
-            st.error("You are not allowed to report WFO for this location.")
-        elif all_attended is None:
-            st.error("Please answer the WFO question before saving.")
-        elif all_attended == "No" and num_unattended < 1:
-            st.error("Please enter how many employees were non-compliant.")
-        elif all_attended == "No" and not comments:
-            st.error("Please add at least one comment explaining the non-compliance.")
-        else:
-            try:
-                sqlserver.insert_wfo(
-                    report_date=report_date,
-                    leader=leader.strip(),
-                    location=location.strip(),
-                    team=team.strip(),
-                    total_headcount=int(total_headcount),
-                    all_attended=all_attended == "Yes",
-                    num_unattended=num_unattended,
-                    created_by=created_by,
-                    comments=comments,
-                    server=server,
-                )
-                st.success("WFO record saved to SQL Server.")
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Could not save the record: {exc}")
-
-    st.divider()
-    st.subheader("Saved WFO records")
+    st.markdown("**WFO**")
     _render_history(sqlserver.fetch_wfo, server)
 
 
@@ -444,11 +439,7 @@ def main() -> None:
     if init_error:
         st.warning(f"Could not verify/create the table in SQL Server: {init_error}")
 
-    absenteeism_tab, wfo_tab = st.tabs(["Absenteeism", "Work From Office"])
-    with absenteeism_tab:
-        render_absenteeism(server, windows_user)
-    with wfo_tab:
-        render_wfo(server, windows_user)
+    render_report(server, windows_user)
 
 
 if __name__ == "__main__":
