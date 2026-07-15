@@ -1,11 +1,13 @@
 """Absenteeism & Work From Office (WFO) tracker.
 
-Two manual-entry modules whose data is stored in SQL Server (Trusted Connection):
-  1. Absenteeism: Vicepresident, Unit, People in unit, planned / unplanned
-     approved leave and days affected, plus a comment. Computes the unplanned
-     percentage of the week.
-  2. Work From Office: expected vs actual attendance and a comment. Computes the
-     attendance percentage.
+Two manual-entry modules that both write to a single SQL Server table
+(``dbo.Attendance_Absenteeism_Report``) over a Trusted Connection:
+  1. Absenteeism: Leader, Location, Team, Total Headcount, planned / unplanned
+     approved leave and days impacted, plus comments. Computes the unplanned
+     percentage of the week and (when the source base is available) the
+     headcount alignment percentage.
+  2. Work From Office: whether all required employees attended, how many were
+     non-compliant, and up to five comments.
 
 Writing is gated by Active Directory group membership, checked via SQL Server's
 IS_MEMBER over the trusted connection.
@@ -18,16 +20,6 @@ import streamlit as st
 
 import sqlserver
 
-WFO_REASONS = [
-    "Medical Appointment",
-    "Personal Emergency",
-    "Approved by Manager for specific reasons",
-    "Work-related (travel, off-site, training, etc)",
-    "Operational (weather, health isolation, suspension)",
-    "Unexcused Absence/Declined WFO",
-    "Other",
-]
-
 # Example values only - replace with the real ones once confirmed.
 LOCATION_OPTIONS = [
     "Bogota",
@@ -37,14 +29,14 @@ LOCATION_OPTIONS = [
     "Remote",
     "Other",
 ]
-VICEPRESIDENT_OPTIONS = [
+LEADER_OPTIONS = [
     "VP Operations",
     "VP Compliance",
     "VP Technology",
     "VP Financial Crimes",
     "Other",
 ]
-UNIT_OPTIONS = [
+TEAM_OPTIONS = [
     "EDDU Regular",
     "ADT",
     "BI & Automations",
@@ -131,10 +123,25 @@ ABSENCE_REFERENCE = [
 ]
 
 
+def render_identity(prefix: str) -> tuple[object, str, str, str, int]:
+    """Render the shared identity fields and return their values.
+
+    Returns (report_week, leader, location, team, total_headcount).
+    """
+    report_week = st.date_input("Report week (date)", value=date.today(), key=f"{prefix}_week")
+    leader = st.selectbox("Leader", options=LEADER_OPTIONS, key=f"{prefix}_leader")
+    location = st.selectbox("Location", options=LOCATION_OPTIONS, key=f"{prefix}_location")
+    team = st.selectbox("Team", options=TEAM_OPTIONS, key=f"{prefix}_team")
+    total_headcount = st.number_input(
+        "Total Headcount", min_value=0, step=1, key=f"{prefix}_headcount"
+    )
+    return report_week, leader, location, team, int(total_headcount)
+
+
 def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> None:
     st.subheader("Absenteeism")
     st.caption(
-        "Register planned and unplanned approved leave for a unit. The unplanned "
+        "Register planned and unplanned approved leave for a team. The unplanned "
         "percentage of the week is calculated over the total days affected."
     )
 
@@ -150,21 +157,40 @@ def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> 
         )
 
     with form_col:
-        record_date = st.date_input("Date", value=date.today())
-        location = st.selectbox("Location", options=LOCATION_OPTIONS)
-        unit = st.selectbox("Unit", options=UNIT_OPTIONS)
-        vicepresident = st.selectbox("Vicepresident", options=VICEPRESIDENT_OPTIONS)
-        people_in_unit = st.number_input("People in unit", min_value=0, step=1)
+        report_week, leader, location, team, total_headcount = render_identity("abs")
 
-        low_headcount = people_in_unit < 20
+        # Headcount alignment vs the official unit headcount (from the source
+        # base). Access is pending, so this is None for now.
+        registered = None
+        try:
+            registered = sqlserver.registered_headcount_for_unit(team, server=server)
+        except Exception:  # noqa: BLE001
+            registered = None
+
+        alignment_pct = None
+        if registered:
+            alignment_pct = round(total_headcount / registered * 100, 2)
+
+        low_alignment = alignment_pct is not None and alignment_pct < 90
         headcount_comment = ""
-        if low_headcount:
-            st.warning(
-                "Please add a comment explaining why the reported people do not "
-                "reach 90% of the registered unit."
+        if alignment_pct is None:
+            st.caption(
+                "Headcount alignment % is pending: no access to the source base yet."
             )
             headcount_comment = st.text_area(
-                "Comment (why the reported people do not reach 90% of the unit)",
+                "Headcount comments (optional)",
+                key="headcount_comment",
+            )
+        else:
+            st.metric("Headcount alignment %", f"{alignment_pct:.2f}%")
+            if low_alignment:
+                st.warning(
+                    "Please add a comment explaining why the reported people do not "
+                    "reach 90% of the registered unit."
+                )
+            headcount_comment = st.text_area(
+                "Headcount comments"
+                + (" (required)" if low_alignment else " (optional)"),
                 key="headcount_comment",
             )
 
@@ -207,7 +233,7 @@ def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> 
         st.caption("Days during the reported week")
 
         total_days, unplanned_pct = unplanned_percentage(
-            int(people_in_unit), int(planned_days), int(unplanned_days)
+            int(total_headcount), int(planned_days), int(unplanned_days)
         )
 
         high_unplanned = unplanned_pct > 3
@@ -229,7 +255,7 @@ def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> 
     if submitted:
         if not can_write:
             st.error("You do not have permission to write.")
-        elif low_headcount and not headcount_comment.strip():
+        elif low_alignment and not headcount_comment.strip():
             st.error(
                 "Please add a comment explaining why the reported people do not "
                 "reach 90% of the registered unit."
@@ -241,20 +267,18 @@ def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> 
         else:
             try:
                 sqlserver.insert_absenteeism(
-                    record_date=record_date,
+                    report_week=report_week,
+                    leader=leader.strip(),
                     location=location.strip(),
-                    vicepresident=vicepresident.strip(),
-                    unit=unit.strip(),
-                    people_in_unit=int(people_in_unit),
-                    planned_leave=int(planned_leave),
-                    planned_days_affected=int(planned_days),
-                    unplanned_leave=int(unplanned_leave),
-                    unplanned_days_affected=int(unplanned_days),
-                    total_days_affected=total_days,
-                    unplanned_pct=unplanned_pct,
-                    headcount_comment=headcount_comment.strip(),
-                    unplanned_comment=unplanned_comment.strip(),
-                    created_by=created_by,
+                    team=team.strip(),
+                    total_headcount=int(total_headcount),
+                    headcount_alignment_pct=alignment_pct,
+                    headcount_comments=headcount_comment.strip(),
+                    days_impacted_planned=int(planned_days),
+                    num_employees_planned_leave=int(planned_leave),
+                    days_impacted_unplanned=int(unplanned_days),
+                    num_employees_unplanned_leave=int(unplanned_leave),
+                    absenteeism_comments=unplanned_comment.strip(),
                     server=server,
                 )
                 st.success("Absenteeism record saved to SQL Server.")
@@ -268,6 +292,8 @@ def render_absenteeism(server: str | None, can_write: bool, created_by: str) -> 
 
 def render_wfo(server: str | None, can_write: bool, created_by: str) -> None:
     st.subheader("Work From Office (WFO)")
+
+    report_week, leader, location, team, total_headcount = render_identity("wfo")
 
     all_attended = st.radio(
         "Did **all** required employees attend the office on every mandatory day during the reported week?",
@@ -283,18 +309,20 @@ def render_wfo(server: str | None, can_write: bool, created_by: str) -> None:
 
     if all_attended == "Yes":
         st.success("All required employees complied. 0 non-compliant employees will be reported.")
-        record_date = st.date_input("Date", value=date.today(), key="wfo_date_yes")
         if st.button("Calculate & Save", disabled=not can_write, key="wfo_save_yes"):
             if not can_write:
                 st.error("You do not have permission to write.")
             else:
                 try:
                     sqlserver.insert_wfo(
-                        record_date=record_date,
-                        all_compliant=True,
-                        non_compliant=0,
-                        reason="",
-                        created_by=created_by,
+                        report_week=report_week,
+                        leader=leader.strip(),
+                        location=location.strip(),
+                        team=team.strip(),
+                        total_headcount=int(total_headcount),
+                        all_attended=True,
+                        num_unattended=0,
+                        comments=[],
                         server=server,
                     )
                     st.success("WFO record saved to SQL Server (0 non-compliant).")
@@ -309,28 +337,44 @@ def render_wfo(server: str | None, can_write: bool, created_by: str) -> None:
         )
         st.caption("If \"No\" is selected, the system will require users to provide the following information:")
 
-        record_date = st.date_input("Date", value=date.today(), key="wfo_date_no")
         non_compliant = st.number_input(
             "How many employees were non-compliant with the WFO requirement this week?",
             min_value=1,
             step=1,
             key="wfo_non_compliant",
         )
-        reason = st.selectbox("Select a Reason", options=WFO_REASONS, key="wfo_reason")
+
+        num_boxes = min(int(non_compliant), 5)
+        st.caption(
+            "Add a comment/reason per non-compliant employee (up to 5)."
+            if int(non_compliant) <= 5
+            else "More than 5 non-compliant employees: only the first 5 comments are stored."
+        )
+        comments: list[str] = []
+        for i in range(num_boxes):
+            comments.append(
+                st.text_input(f"WFO comment {i + 1}", key=f"wfo_comment_{i + 1}")
+            )
 
         if st.button("Calculate & Save", disabled=not can_write, key="wfo_save_no"):
+            filled = [c.strip() for c in comments if c.strip()]
             if not can_write:
                 st.error("You do not have permission to write.")
             elif int(non_compliant) < 1:
                 st.error("Please enter how many employees were non-compliant.")
+            elif not filled:
+                st.error("Please add at least one comment explaining the non-compliance.")
             else:
                 try:
                     sqlserver.insert_wfo(
-                        record_date=record_date,
-                        all_compliant=False,
-                        non_compliant=int(non_compliant),
-                        reason=reason.strip(),
-                        created_by=created_by,
+                        report_week=report_week,
+                        leader=leader.strip(),
+                        location=location.strip(),
+                        team=team.strip(),
+                        total_headcount=int(total_headcount),
+                        all_attended=False,
+                        num_unattended=int(non_compliant),
+                        comments=filled,
                         server=server,
                     )
                     st.success("WFO record saved to SQL Server.")

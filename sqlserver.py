@@ -121,53 +121,88 @@ def can_write(server: str | None = None, database: str | None = None) -> bool:
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
+#
+# Single unified table provided by the business:
+#   dbo.Attendance_Absenteeism_Report
+# It holds both the Absenteeism and the WFO information. Absenteeism numeric
+# columns are NOT NULL; WFO columns are nullable. Because we keep two separate
+# save actions, a WFO-only row stores 0 in the required absenteeism numeric
+# columns, and an absenteeism-only row leaves the WFO columns NULL.
 
-_CREATE_ABSENTEEISM = """
-IF OBJECT_ID('dbo.Absenteeism_Records', 'U') IS NULL
-CREATE TABLE dbo.Absenteeism_Records (
-    Id                     INT IDENTITY(1,1) PRIMARY KEY,
-    RecordDate             DATE           NOT NULL,
-    Location               NVARCHAR(200)  NULL,
-    Vicepresident          NVARCHAR(200)  NULL,
-    Unit                   NVARCHAR(200)  NULL,
-    PeopleInUnit           INT            NULL,
-    PlannedLeave           INT            NULL,
-    PlannedDaysAffected    INT            NULL,
-    UnplannedLeave         INT            NULL,
-    UnplannedDaysAffected  INT            NULL,
-    TotalDaysAffected      INT            NULL,
-    UnplannedPct           FLOAT          NULL,
-    HeadcountComment       NVARCHAR(1000) NULL,
-    UnplannedComment       NVARCHAR(1000) NULL,
-    CreatedBy              NVARCHAR(200)  NULL,
-    CreatedAt              DATETIME       NOT NULL DEFAULT GETDATE()
+REPORT_TABLE = "dbo.Attendance_Absenteeism_Report"
+
+_CREATE_REPORT = """
+IF OBJECT_ID('dbo.Attendance_Absenteeism_Report', 'U') IS NULL
+CREATE TABLE dbo.Attendance_Absenteeism_Report (
+    Id                             INT IDENTITY(1,1) PRIMARY KEY,
+    Report_Week                    DATE            NULL,
+    Leader                         VARCHAR(150)    NOT NULL,
+    Location                       VARCHAR(100)    NOT NULL,
+    Team                           VARCHAR(150)    NOT NULL,
+    Total_Headcount                INT             NOT NULL,
+    Headcount_Alignment_Pct        DECIMAL(6, 2)   NULL,
+    Headcount_Comments             VARCHAR(1000)   NULL,
+    Days_Impacted_Planned          DECIMAL(8, 2)   NOT NULL,
+    Num_Employees_Planned_Leave    INT             NOT NULL,
+    Days_Impacted_Unplanned        DECIMAL(8, 2)   NOT NULL,
+    Num_Employees_Unplanned_Leave  INT             NOT NULL,
+    Absenteeism_Comments           VARCHAR(1000)   NULL,
+    WFO_All_Attended_Flag          BIT             NULL,
+    Num_WFO_Unattended             INT             NULL,
+    WFO_Comment1                   VARCHAR(500)    NULL,
+    WFO_Comment2                   VARCHAR(500)    NULL,
+    WFO_Comment3                   VARCHAR(500)    NULL,
+    WFO_Comment4                   VARCHAR(500)    NULL,
+    WFO_Comment5                   VARCHAR(500)    NULL,
+    CreatedAt                      DATETIME        NOT NULL DEFAULT GETDATE()
 );
 """
 
-_CREATE_WFO = """
-IF OBJECT_ID('dbo.WFO_Records', 'U') IS NULL
-CREATE TABLE dbo.WFO_Records (
-    Id                 INT IDENTITY(1,1) PRIMARY KEY,
-    RecordDate         DATE           NOT NULL,
-    AllCompliant       BIT            NULL,
-    NonCompliantCount  INT            NULL,
-    Reason             NVARCHAR(1000) NULL,
-    CreatedBy          NVARCHAR(200)  NULL,
-    CreatedAt          DATETIME       NOT NULL DEFAULT GETDATE()
-);
+# The business table already exists without a week/date column, so make sure a
+# Report_Week column is present (added only if the login has ALTER permission).
+_ENSURE_REPORT_WEEK = """
+IF OBJECT_ID('dbo.Attendance_Absenteeism_Report', 'U') IS NOT NULL
+   AND COL_LENGTH('dbo.Attendance_Absenteeism_Report', 'Report_Week') IS NULL
+    ALTER TABLE dbo.Attendance_Absenteeism_Report ADD Report_Week DATE NULL;
 """
 
 
 def init_db(server: str | None = None, database: str | None = None) -> None:
-    """Create the Absenteeism and WFO tables if they do not exist yet."""
+    """Ensure the report table (and its Report_Week column) exists."""
     conn = get_connection(server=server, database=database)
     try:
         cursor = conn.cursor()
-        cursor.execute(_CREATE_ABSENTEEISM)
-        cursor.execute(_CREATE_WFO)
+        cursor.execute(_CREATE_REPORT)
+        cursor.execute(_ENSURE_REPORT_WEEK)
         conn.commit()
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Headcount alignment source (pending access)
+# ---------------------------------------------------------------------------
+
+def registered_headcount_for_unit(
+    team: str,
+    unit_id: str | int | None = None,
+    server: str | None = None,
+    database: str | None = None,
+) -> int | None:
+    """Return the official registered headcount for a unit.
+
+    The alignment % compares the reported ``Total_Headcount`` against the number
+    of people that belong to the unit (matched by its id) in another database.
+    Access to that source base is not granted yet, so this returns ``None`` and
+    the alignment % cannot be computed automatically for now.
+
+    TODO(when access is granted): replace the body with something like::
+
+        SELECT COUNT(*)
+        FROM [OtherDatabase].[dbo].[SomeUnitPeopleTable]
+        WHERE UnitId = ?
+    """
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -175,49 +210,47 @@ def init_db(server: str | None = None, database: str | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 def insert_absenteeism(
-    record_date,
+    report_week,
+    leader: str,
     location: str,
-    vicepresident: str,
-    unit: str,
-    people_in_unit: int,
-    planned_leave: int,
-    planned_days_affected: int,
-    unplanned_leave: int,
-    unplanned_days_affected: int,
-    total_days_affected: int,
-    unplanned_pct: float,
-    headcount_comment: str,
-    unplanned_comment: str,
-    created_by: str,
+    team: str,
+    total_headcount: int,
+    headcount_alignment_pct: float | None,
+    headcount_comments: str,
+    days_impacted_planned: float,
+    num_employees_planned_leave: int,
+    days_impacted_unplanned: float,
+    num_employees_unplanned_leave: int,
+    absenteeism_comments: str,
     server: str | None = None,
     database: str | None = None,
 ) -> None:
-    """Insert one Absenteeism record into SQL Server."""
+    """Insert one Absenteeism row (WFO columns left NULL)."""
     conn = get_connection(server=server, database=database)
     try:
         cursor = conn.cursor()
         cursor.execute(
-            """
-            INSERT INTO dbo.Absenteeism_Records (
-                RecordDate, Location, Vicepresident, Unit, PeopleInUnit,
-                PlannedLeave, PlannedDaysAffected, UnplannedLeave, UnplannedDaysAffected,
-                TotalDaysAffected, UnplannedPct, HeadcountComment, UnplannedComment, CreatedBy
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            f"""
+            INSERT INTO {REPORT_TABLE} (
+                Report_Week, Leader, Location, Team, Total_Headcount,
+                Headcount_Alignment_Pct, Headcount_Comments,
+                Days_Impacted_Planned, Num_Employees_Planned_Leave,
+                Days_Impacted_Unplanned, Num_Employees_Unplanned_Leave,
+                Absenteeism_Comments
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            record_date,
+            report_week,
+            leader,
             location,
-            vicepresident,
-            unit,
-            people_in_unit,
-            planned_leave,
-            planned_days_affected,
-            unplanned_leave,
-            unplanned_days_affected,
-            total_days_affected,
-            unplanned_pct,
-            headcount_comment,
-            unplanned_comment,
-            created_by,
+            team,
+            total_headcount,
+            headcount_alignment_pct,
+            headcount_comments,
+            days_impacted_planned,
+            num_employees_planned_leave,
+            days_impacted_unplanned,
+            num_employees_unplanned_leave,
+            absenteeism_comments,
         )
         conn.commit()
     finally:
@@ -225,11 +258,13 @@ def insert_absenteeism(
 
 
 def fetch_absenteeism(server: str | None = None, database: str | None = None) -> pd.DataFrame:
-    """Return all Absenteeism records, newest first."""
+    """Return absenteeism rows (those without WFO data), newest first."""
     conn = get_connection(server=server, database=database)
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM dbo.Absenteeism_Records ORDER BY Id DESC")
+        cursor.execute(
+            f"SELECT * FROM {REPORT_TABLE} WHERE WFO_All_Attended_Flag IS NULL ORDER BY Id DESC"
+        )
         return _result_to_df(cursor)
     finally:
         conn.close()
@@ -240,29 +275,53 @@ def fetch_absenteeism(server: str | None = None, database: str | None = None) ->
 # ---------------------------------------------------------------------------
 
 def insert_wfo(
-    record_date,
-    all_compliant: bool,
-    non_compliant: int,
-    reason: str,
-    created_by: str,
+    report_week,
+    leader: str,
+    location: str,
+    team: str,
+    total_headcount: int,
+    all_attended: bool,
+    num_unattended: int,
+    comments: list[str] | None = None,
     server: str | None = None,
     database: str | None = None,
 ) -> None:
-    """Insert one WFO record into SQL Server."""
+    """Insert one WFO row.
+
+    The absenteeism numeric columns are NOT NULL in the shared table, so they are
+    stored as 0 for a WFO-only row. Up to five comments map to WFO_Comment1..5.
+    """
+    comments = comments or []
+    padded = [(comments[i] if i < len(comments) else None) for i in range(5)]
     conn = get_connection(server=server, database=database)
     try:
         cursor = conn.cursor()
         cursor.execute(
-            """
-            INSERT INTO dbo.WFO_Records (
-                RecordDate, AllCompliant, NonCompliantCount, Reason, CreatedBy
-            ) VALUES (?, ?, ?, ?, ?)
+            f"""
+            INSERT INTO {REPORT_TABLE} (
+                Report_Week, Leader, Location, Team, Total_Headcount,
+                Days_Impacted_Planned, Num_Employees_Planned_Leave,
+                Days_Impacted_Unplanned, Num_Employees_Unplanned_Leave,
+                WFO_All_Attended_Flag, Num_WFO_Unattended,
+                WFO_Comment1, WFO_Comment2, WFO_Comment3, WFO_Comment4, WFO_Comment5
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            record_date,
-            1 if all_compliant else 0,
-            non_compliant,
-            reason,
-            created_by,
+            report_week,
+            leader,
+            location,
+            team,
+            total_headcount,
+            0,
+            0,
+            0,
+            0,
+            1 if all_attended else 0,
+            num_unattended,
+            padded[0],
+            padded[1],
+            padded[2],
+            padded[3],
+            padded[4],
         )
         conn.commit()
     finally:
@@ -270,11 +329,13 @@ def insert_wfo(
 
 
 def fetch_wfo(server: str | None = None, database: str | None = None) -> pd.DataFrame:
-    """Return all WFO records, newest first."""
+    """Return WFO rows (those with a WFO flag set), newest first."""
     conn = get_connection(server=server, database=database)
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM dbo.WFO_Records ORDER BY Id DESC")
+        cursor.execute(
+            f"SELECT * FROM {REPORT_TABLE} WHERE WFO_All_Attended_Flag IS NOT NULL ORDER BY Id DESC"
+        )
         return _result_to_df(cursor)
     finally:
         conn.close()
