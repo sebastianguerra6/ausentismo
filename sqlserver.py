@@ -93,9 +93,9 @@ def get_connection(server: str | None = None, database: str | None = None):
 #
 # Single unified table provided by the business:
 #   dbo.Attendance_Absenteeism_Report
-# Each submission is ONE row that always holds the Absenteeism information and,
-# when the WFO module applies, the WFO information too. WFO columns are nullable,
-# so a row without WFO simply leaves them NULL.
+# Absenteeism and WFO are saved as SEPARATE rows. An absenteeism row leaves the
+# WFO columns NULL; a WFO row stores 0 in the NOT NULL absenteeism numeric
+# columns. Report_Date is stored as the Monday of the reported week.
 
 REPORT_TABLE = "dbo.Attendance_Absenteeism_Report"
 
@@ -165,10 +165,10 @@ def registered_headcount_for_unit(
 
 
 # ---------------------------------------------------------------------------
-# Report (Absenteeism + optional WFO) — one combined row
+# Absenteeism (own row; WFO columns left NULL)
 # ---------------------------------------------------------------------------
 
-def insert_report(
+def insert_absenteeism(
     report_date,
     leader: str,
     location: str,
@@ -181,22 +181,10 @@ def insert_report(
     days_impacted_unplanned: float,
     num_employees_unplanned_leave: int,
     absenteeism_comments: str,
-    wfo_all_attended: bool | None = None,
-    num_wfo_unattended: int | None = None,
-    wfo_comments: list[str] | None = None,
     server: str | None = None,
     database: str | None = None,
 ) -> None:
-    """Insert one combined report row.
-
-    When ``wfo_all_attended`` is None, the WFO module did not apply and its
-    columns are stored as NULL. Otherwise the WFO answers are saved and up to
-    five comments map to WFO_Comment1..5.
-    """
-    comments = wfo_comments or []
-    padded = [(comments[i] if i < len(comments) else None) for i in range(5)]
-    wfo_flag = None if wfo_all_attended is None else (1 if wfo_all_attended else 0)
-
+    """Insert one Absenteeism row (WFO columns left NULL)."""
     conn = get_connection(server=server, database=database)
     try:
         cursor = conn.cursor()
@@ -207,10 +195,8 @@ def insert_report(
                 Headcount_Alignment_Pct, Headcount_Comments,
                 Days_Impacted_Planned, Num_Employees_Planned_Leave,
                 Days_Impacted_Unplanned, Num_Employees_Unplanned_Leave,
-                Absenteeism_Comments,
-                WFO_All_Attended_Flag, Num_WFO_Unattended,
-                WFO_Comment1, WFO_Comment2, WFO_Comment3, WFO_Comment4, WFO_Comment5
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                Absenteeism_Comments
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             report_date,
             leader,
@@ -224,8 +210,72 @@ def insert_report(
             days_impacted_unplanned,
             num_employees_unplanned_leave,
             absenteeism_comments,
-            wfo_flag,
-            num_wfo_unattended,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fetch_absenteeism(server: str | None = None, database: str | None = None) -> pd.DataFrame:
+    """Return absenteeism rows (those without WFO data), newest first."""
+    conn = get_connection(server=server, database=database)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT * FROM {REPORT_TABLE} WHERE WFO_All_Attended_Flag IS NULL ORDER BY Id DESC"
+        )
+        return _result_to_df(cursor)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Work From Office (WFO) (own row; absenteeism numeric columns stored as 0)
+# ---------------------------------------------------------------------------
+
+def insert_wfo(
+    report_date,
+    leader: str,
+    location: str,
+    team: str,
+    total_headcount: int,
+    all_attended: bool,
+    num_unattended: int,
+    comments: list[str] | None = None,
+    server: str | None = None,
+    database: str | None = None,
+) -> None:
+    """Insert one WFO row.
+
+    The absenteeism numeric columns are NOT NULL in the shared table, so they are
+    stored as 0 for a WFO-only row. Up to five comments map to WFO_Comment1..5.
+    """
+    comments = comments or []
+    padded = [(comments[i] if i < len(comments) else None) for i in range(5)]
+    conn = get_connection(server=server, database=database)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            INSERT INTO {REPORT_TABLE} (
+                Report_Date, Leader, Location, Team, Total_Headcount,
+                Days_Impacted_Planned, Num_Employees_Planned_Leave,
+                Days_Impacted_Unplanned, Num_Employees_Unplanned_Leave,
+                WFO_All_Attended_Flag, Num_WFO_Unattended,
+                WFO_Comment1, WFO_Comment2, WFO_Comment3, WFO_Comment4, WFO_Comment5
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            report_date,
+            leader,
+            location,
+            team,
+            total_headcount,
+            0,
+            0,
+            0,
+            0,
+            1 if all_attended else 0,
+            num_unattended,
             padded[0],
             padded[1],
             padded[2],
@@ -237,12 +287,14 @@ def insert_report(
         conn.close()
 
 
-def fetch_reports(server: str | None = None, database: str | None = None) -> pd.DataFrame:
-    """Return all report rows, newest first."""
+def fetch_wfo(server: str | None = None, database: str | None = None) -> pd.DataFrame:
+    """Return WFO rows (those with a WFO flag set), newest first."""
     conn = get_connection(server=server, database=database)
     try:
         cursor = conn.cursor()
-        cursor.execute(f"SELECT * FROM {REPORT_TABLE} ORDER BY Id DESC")
+        cursor.execute(
+            f"SELECT * FROM {REPORT_TABLE} WHERE WFO_All_Attended_Flag IS NOT NULL ORDER BY Id DESC"
+        )
         return _result_to_df(cursor)
     finally:
         conn.close()

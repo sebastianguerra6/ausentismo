@@ -83,6 +83,8 @@ Server / database are read in this order:
 table-creation permission). The date column is `Report_Date` (NOT NULL) and is
 always stored as the Monday of the reported week.
 
-Each submission is a single row: the absenteeism data is always present, and the
-WFO columns are filled only when the WFO module applies to that location
-(otherwise they stay NULL).
+Absenteeism and WFO are saved as separate rows (separate tabs). An absenteeism
+row leaves the WFO columns NULL; a WFO row stores 0 in the required absenteeism
+numeric columns. The WFO "Calculate & Save" button is disabled for people/
+locations not allowed to report WFO (driven by the by-country headcount source,
+access pending).
