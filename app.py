@@ -31,10 +31,6 @@ LOCATION_OPTIONS = [
     "Other",
 ]
 
-# Locations/countries whose people must also report WFO. This will be driven by
-# the by-country headcount source once access is granted; for now Canada is set
-# as an example of a location that has WFO access.
-WFO_ALLOWED_LOCATIONS = {"Canada"}
 LEADER_OPTIONS = [
     "VP Operations",
     "VP Compliance",
@@ -134,17 +130,12 @@ def monday_of_week(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
 
-def can_use_wfo(location: str) -> bool:
-    """Whether the current person/location has WFO access.
-
-    When True, the WFO section is shown and must be filled together with the
-    absenteeism data. This will be driven by the by-country headcount source
-    once access is granted (see ``WFO_ALLOWED_LOCATIONS`` for the example).
-    """
-    return location in WFO_ALLOWED_LOCATIONS
-
-
-def render_identity(prefix: str) -> tuple[date, str, str, str, int]:
+def render_identity(
+    prefix: str,
+    *,
+    default_location: str | None = None,
+    default_headcount: int = 0,
+) -> tuple[date, str, str, str, int]:
     """Render the shared identity fields and return their values.
 
     Returns (report_date, leader, location, team, total_headcount). The date is
@@ -156,20 +147,64 @@ def render_identity(prefix: str) -> tuple[date, str, str, str, int]:
         key=f"{prefix}_date",
     )
     leader = st.selectbox("Leader", options=LEADER_OPTIONS, key=f"{prefix}_leader")
-    location = st.selectbox("Location", options=LOCATION_OPTIONS, key=f"{prefix}_location")
+    location_options = list(LOCATION_OPTIONS)
+    if default_location and default_location not in location_options:
+        location_options = [default_location, *location_options]
+    location_index = (
+        location_options.index(default_location)
+        if default_location in location_options
+        else 0
+    )
+    location = st.selectbox(
+        "Location",
+        options=location_options,
+        index=location_index,
+        key=f"{prefix}_location",
+    )
     team = st.selectbox("Team", options=TEAM_OPTIONS, key=f"{prefix}_team")
+    headcount_key = f"{prefix}_headcount"
+    if headcount_key not in st.session_state:
+        st.session_state[headcount_key] = int(default_headcount or 0)
     total_headcount = st.number_input(
-        "Total Headcount", min_value=0, step=1, key=f"{prefix}_headcount"
+        "Total Headcount",
+        min_value=0,
+        step=1,
+        key=headcount_key,
+        help="Pre-filled with the number of people who report to you in GlobalWorkforceHR.",
     )
     return monday_of_week(report_date), leader, location, team, int(total_headcount)
 
 
-def render_report(server: str | None, created_by: str) -> None:
+def render_report(server: str | None, created_by: str, profile: dict) -> None:
     st.subheader("Weekly report")
     st.caption(
-        "Register the team's absenteeism. If your location has WFO access, the "
-        "WFO section is mandatory and must be filled in the same submission."
+        "Register the team's absenteeism. If your Country Name in HR is Canada, "
+        "the WFO section is mandatory and must be filled in the same submission."
     )
+
+    # Permissions and official headcount come from GlobalWorkforceHR.
+    registered = profile.get("team_headcount")
+    wfo_required = bool(profile.get("wfo_allowed"))
+    country = profile.get("country_name")
+
+    if not profile.get("found"):
+        st.warning(
+            "Your Scotia ID was not found in GlobalWorkforceHR. "
+            "Headcount and WFO access could not be resolved automatically."
+        )
+    elif not profile.get("is_manager"):
+        st.warning(
+            "Your Position Title does not contain \"Manager\", so no team headcount "
+            "was calculated from Manager Position Code."
+        )
+    else:
+        st.success(
+            f"Manager profile loaded: **{profile.get('display_name') or created_by}** · "
+            f"Position Code **{profile.get('position_code')}** · "
+            f"Team headcount **{registered}** · "
+            f"Country **{country or 'N/A'}** · "
+            f"WFO {'required' if wfo_required else 'not required'}."
+        )
 
     form_col, ref_col = st.columns([2, 1])
 
@@ -183,33 +218,33 @@ def render_report(server: str | None, created_by: str) -> None:
         )
 
     with form_col:
-        report_date, leader, location, team, total_headcount = render_identity("rep")
-        wfo_required = can_use_wfo(location)
-
-        # Headcount alignment vs the official unit headcount (from the source
-        # base). Access is pending, so this is None for now.
-        registered = None
-        try:
-            registered = sqlserver.registered_headcount_for_unit(team, server=server)
-        except Exception:  # noqa: BLE001
-            registered = None
+        report_date, leader, location, team, total_headcount = render_identity(
+            "rep",
+            default_location=country,
+            default_headcount=int(registered or 0),
+        )
 
         alignment_pct = None
-        if registered:
+        if registered and registered > 0:
             alignment_pct = round(total_headcount / registered * 100, 2)
 
         low_alignment = alignment_pct is not None and alignment_pct < 90
         headcount_comment = ""
         if alignment_pct is None:
             st.caption(
-                "Headcount alignment % is pending: no access to the source base yet."
+                "Headcount alignment % is unavailable until your manager profile "
+                "and team headcount can be read from GlobalWorkforceHR."
             )
             headcount_comment = st.text_area(
                 "Headcount comments (optional)",
                 key="headcount_comment",
             )
         else:
-            st.metric("Headcount alignment %", f"{alignment_pct:.2f}%")
+            st.metric(
+                "Headcount alignment %",
+                f"{alignment_pct:.2f}%",
+                help=f"Reported Total Headcount / official team headcount ({registered}) from HR.",
+            )
             if low_alignment:
                 st.warning(
                     "Please add a comment explaining why the reported people do not "
@@ -285,7 +320,9 @@ def render_report(server: str | None, created_by: str) -> None:
         if wfo_required:
             st.divider()
             st.markdown("**Work From Office (WFO)**")
-            st.caption("Your location has WFO access, so this section is mandatory.")
+            st.caption(
+                "Your Country Name in HR is Canada, so this section is mandatory."
+            )
             wfo_answer = st.radio(
                 "Did **all** required employees attend the office on every mandatory day during the reported week?",
                 options=["Yes", "No"],
@@ -326,7 +363,10 @@ def render_report(server: str | None, created_by: str) -> None:
                         wfo_comments.append(value.strip())
         else:
             st.divider()
-            st.caption("WFO reporting is not required for this location.")
+            st.caption(
+                "WFO reporting is not required for your country "
+                f"({country or 'unknown'}). Absenteeism only."
+            )
 
         submitted = st.button("Calculate & Save", key="report_submit")
 
@@ -339,7 +379,7 @@ def render_report(server: str | None, created_by: str) -> None:
         elif high_unplanned and not unplanned_comment.strip():
             st.error("Please add a comment explaining why the unplanned percentage is above 3%.")
         elif wfo_required and wfo_answer is None:
-            st.error("Your location requires WFO. Please answer the WFO question before saving.")
+            st.error("Canada requires WFO. Please answer the WFO question before saving.")
         elif wfo_required and wfo_answer == "No" and wfo_num_unattended < 1:
             st.error("Please enter how many employees were non-compliant.")
         elif wfo_required and wfo_answer == "No" and not wfo_comments:
@@ -417,6 +457,7 @@ def main() -> None:
     )
 
     windows_user = sqlserver.current_windows_domain_user()
+    scotia_id = sqlserver.current_windows_user()
     server = st.text_input(
         "SQL Server host",
         value=st.session_state.get("sqlserver_host", ""),
@@ -435,11 +476,39 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         init_error = str(exc)
 
-    st.info(f"Signed in as (Windows user): **{windows_user}**")
+    # Resolve manager / team / WFO access from GlobalWorkforceHR using Scotia ID.
+    profile_key = f"hr_profile::{server}::{scotia_id}"
+    profile_error = None
+    if profile_key not in st.session_state:
+        try:
+            st.session_state[profile_key] = sqlserver.fetch_manager_profile(
+                scotia_id=scotia_id,
+                server=server,
+            )
+        except Exception as exc:  # noqa: BLE001
+            profile_error = str(exc)
+            st.session_state[profile_key] = {
+                "scotia_id": scotia_id,
+                "found": False,
+                "is_manager": False,
+                "position_code": None,
+                "position_title": None,
+                "country_name": None,
+                "team_headcount": None,
+                "wfo_allowed": False,
+                "display_name": None,
+            }
+    profile = st.session_state[profile_key]
+
+    st.info(f"Signed in as (Windows user): **{windows_user}** · Scotia ID: **{scotia_id}**")
     if init_error:
         st.warning(f"Could not verify/create the table in SQL Server: {init_error}")
+    if profile_error:
+        st.warning(
+            f"Could not read GlobalWorkforceHR (headcount / WFO access): {profile_error}"
+        )
 
-    render_report(server, windows_user)
+    render_report(server, windows_user, profile)
 
 
 if __name__ == "__main__":

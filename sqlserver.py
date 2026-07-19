@@ -149,29 +149,109 @@ def init_db(server: str | None = None, database: str | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Headcount alignment source (pending access)
+# Headcount / WFO access source: [EDDU_ID].[dbo].[GlobalWorkforceHR]
 # ---------------------------------------------------------------------------
 
-def registered_headcount_for_unit(
-    team: str,
-    unit_id: str | int | None = None,
+HR_TABLE = "[EDDU_ID].[dbo].[GlobalWorkforceHR]"
+WFO_COUNTRY = "Canada"
+
+_MANAGER_PROFILE_SQL = f"""
+SELECT TOP 1
+    m.[Scotia ID Confidential] AS ScotiaId,
+    m.[Position Title]         AS PositionTitle,
+    m.[Position Code]          AS PositionCode,
+    m.[Country Name]           AS CountryName,
+    m.[Preferred First Name]   AS PreferredFirstName,
+    m.[Employee Last Name]     AS EmployeeLastName,
+    CASE
+        WHEN m.[Position Title] LIKE '%Manager%' THEN 1
+        ELSE 0
+    END AS IsManager,
+    CASE
+        WHEN m.[Position Title] LIKE '%Manager%' THEN (
+            SELECT COUNT(*)
+            FROM {HR_TABLE} r
+            WHERE r.[Manager Position Code] = m.[Position Code]
+        )
+        ELSE 0
+    END AS TeamHeadcount
+FROM {HR_TABLE} m
+WHERE m.[Scotia ID Confidential] = ?
+"""
+
+
+def fetch_manager_profile(
+    scotia_id: str | None = None,
+    server: str | None = None,
+    database: str | None = None,
+) -> dict:
+    """Look up the signed-in person in GlobalWorkforceHR and derive team info.
+
+    Logic:
+      1. Match ``Scotia ID Confidential`` to the Windows user (Scotia ID).
+      2. If ``Position Title`` LIKE '%Manager%', take their ``Position Code``.
+      3. Count people whose ``Manager Position Code`` equals that code (= team size).
+      4. If ``Country Name`` = 'Canada', the person has WFO access; otherwise
+         they only report Absenteeism.
+
+    Returns a dict with keys: scotia_id, found, is_manager, position_code,
+    position_title, country_name, team_headcount, wfo_allowed, display_name.
+    """
+    scotia_id = (scotia_id or current_windows_user()).strip()
+    empty = {
+        "scotia_id": scotia_id,
+        "found": False,
+        "is_manager": False,
+        "position_code": None,
+        "position_title": None,
+        "country_name": None,
+        "team_headcount": None,
+        "wfo_allowed": False,
+        "display_name": None,
+    }
+    if not scotia_id:
+        return empty
+
+    conn = get_connection(server=server, database=database)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(_MANAGER_PROFILE_SQL, scotia_id)
+        row = cursor.fetchone()
+        if not row:
+            return empty
+
+        columns = [col[0] for col in cursor.description]
+        data = dict(zip(columns, row))
+        is_manager = bool(data.get("IsManager"))
+        country = (data.get("CountryName") or "").strip()
+        first = (data.get("PreferredFirstName") or "").strip()
+        last = (data.get("EmployeeLastName") or "").strip()
+        display = " ".join(p for p in (first, last) if p) or None
+        team_count = int(data.get("TeamHeadcount") or 0) if is_manager else None
+
+        return {
+            "scotia_id": data.get("ScotiaId") or scotia_id,
+            "found": True,
+            "is_manager": is_manager,
+            "position_code": data.get("PositionCode"),
+            "position_title": data.get("PositionTitle"),
+            "country_name": country or None,
+            "team_headcount": team_count,
+            "wfo_allowed": country.casefold() == WFO_COUNTRY.casefold(),
+            "display_name": display,
+        }
+    finally:
+        conn.close()
+
+
+def registered_headcount_for_manager(
+    scotia_id: str | None = None,
     server: str | None = None,
     database: str | None = None,
 ) -> int | None:
-    """Return the official registered headcount for a unit.
-
-    The alignment % compares the reported ``Total_Headcount`` against the number
-    of people that belong to the unit (matched by its id) in another database.
-    Access to that source base is not granted yet, so this returns ``None`` and
-    the alignment % cannot be computed automatically for now.
-
-    TODO(when access is granted): replace the body with something like::
-
-        SELECT COUNT(*)
-        FROM [OtherDatabase].[dbo].[SomeUnitPeopleTable]
-        WHERE UnitId = ?
-    """
-    return None
+    """Return the manager's official team headcount, or None if not available."""
+    profile = fetch_manager_profile(scotia_id=scotia_id, server=server, database=database)
+    return profile.get("team_headcount")
 
 
 # ---------------------------------------------------------------------------
