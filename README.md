@@ -1,51 +1,41 @@
 # Absenteeism & WFO Tracker
 
-A Streamlit app with two manual-entry modules, styled in Scotiabank red and white.
-All data is stored in **SQL Server** (`[Bogota_GBS_NS]`) using **Windows
-Authentication (Trusted Connection)**. Read/write permissions are enforced by
-SQL Server for the connected Windows user; there is no application-level
-authorization.
+A Streamlit app styled in Scotiabank red and white. Data is stored in **SQL
+Server** (`[Bogota_GBS_NS]`).
 
-Both modules write to a single table: **`dbo.Attendance_Absenteeism_Report`**.
+## Authentication (VM / service account)
+
+Users sign in with **Scotia ID + app password** (`dbo.App_Users`):
+
+1. Credentials are checked against `App_Users` (bcrypt, `IsActive`).
+2. SQL Server uses **Trusted Connection** as the Windows **service account**
+   that runs Streamlit on the VM (no per-user Windows password / impersonation).
+3. Write access = `App_Users.CanWrite` **and** the service account has `INSERT`.
+4. Scotia ID → `Created_By`, session context `AppUser`, and `GlobalWorkforceHR`
+   (Canada → WFO required; team headcount for alignment %).
+
+Grant `SELECT`/`INSERT` to the service account only. See
+`scripts/create_app_users.sql`.
 
 ## Modules
 
+Both modules write to **`dbo.Attendance_Absenteeism_Report`** as separate rows.
+
 ### 1. Absenteeism
 
-Inputs:
-- Report week (date)
-- Leader
-- Location
-- Team
-- Total Headcount
-- Headcount comments (required only when the alignment % is below 90%)
-- Number of employees on planned leave and Days Impacted (planned)
-- Number of employees on unplanned leave and Days Impacted (unplanned)
-- Comments (required only when % Unplanned is above 3%)
-
-Calculations:
-- `Total days affected = planned days impacted + unplanned days impacted`
-- `% Unplanned (week) = (Days Impacted Unplanned / 5) / (Total Headcount - Days Impacted Planned) * 100`
-  (0 when the denominator is not positive)
-- `Headcount Alignment % = Total Headcount / official unit headcount * 100`
-  — computed from a separate source base matched by unit id. Access to that
-  base is pending, so this is left empty (NULL) for now.
+Inputs: Report date (Monday), Leader, Location, Team, Total Headcount, planned /
+unplanned leave counts and days impacted, comments when required.
 
 ### 2. Work From Office (WFO)
 
-Flow:
-- Identity fields (report week, Leader, Location, Team, Total Headcount).
-- Question: "Did all required employees attend the office on every mandatory day
-  during the reported week?"
-  - **Yes** → 0 non-compliant employees are reported.
-  - **No** → capture how many were non-compliant and up to 5 comments
-    (`WFO_Comment1..5`).
+Shown and **mandatory** when `Country Name` in HR is **Canada**.
 
 ## Requirements
 
+- Windows OS (service account to run Streamlit)
 - Python 3.10+
-- An ODBC driver (e.g. **ODBC Driver 18 for SQL Server**).
-- Network access to the SQL Server using Windows Authentication.
+- ODBC Driver 18 for SQL Server (or 17)
+- Service account with SQL permissions (not each end-user Windows login)
 
 ## Setup
 
@@ -53,8 +43,16 @@ Flow:
 pip install -r requirements.txt
 ```
 
-Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and set the
-SQL Server host and database.
+1. Run Streamlit as the service account (Windows service / Task Scheduler / etc.).
+2. Run `scripts/create_app_users.sql` and grant that service account.
+3. Hash an app password and insert into `App_Users`:
+
+```bash
+python scripts/hash_password.py
+```
+
+4. Copy `.streamlit/secrets.toml.example` → `.streamlit/secrets.toml` and set
+   the SQL Server host/database if needed.
 
 ## Run
 
@@ -62,29 +60,9 @@ SQL Server host and database.
 streamlit run app.py
 ```
 
-## Configuration priority
-
-Server / database are read in this order:
-
-1. The "SQL Server host" field in the app (for the host).
-2. `.streamlit/secrets.toml` (`[sqlserver] server` / `database`).
-3. Environment variables `SQLSERVER_HOST` / `SQLSERVER_DATABASE`.
-
 ## Files
 
-- `app.py` — Streamlit UI: the two modules and calculations.
-- `sqlserver.py` — SQL Server data layer: connection, table bootstrap, and
-  insert/fetch for both modules.
-- `requirements.txt` — Python dependencies.
-
-## Database table
-
-`dbo.Attendance_Absenteeism_Report` is auto-created if missing (requires
-table-creation permission). The date column is `Report_Date` (NOT NULL) and is
-always stored as the Monday of the reported week.
-
-Absenteeism and WFO are saved as separate rows (separate tabs). An absenteeism
-row leaves the WFO columns NULL; a WFO row stores 0 in the required absenteeism
-numeric columns. The WFO "Calculate & Save" button is disabled for people/
-locations not allowed to report WFO (driven by the by-country headcount source,
-access pending).
+- `app.py` — Login UI + weekly report form.
+- `sqlserver.py` — Trusted Connection (service account) + App_Users auth + HR/inserts.
+- `scripts/create_app_users.sql` — `App_Users` DDL + service account grants.
+- `scripts/hash_password.py` — bcrypt helper for app passwords.

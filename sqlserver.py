@@ -1,9 +1,17 @@
 """SQL Server data layer for the Absenteeism / WFO tool.
 
-All persistence lives in SQL Server (``[Bogota_GBS_NS]``) and uses Windows
-Authentication (Trusted Connection) through pyodbc. Because the connection is
-trusted, the SQL Server login is the Windows user running the app, and SQL
-Server itself enforces read/write permissions for that user.
+Persistence lives in SQL Server (``[Bogota_GBS_NS]``).
+
+Authentication model (VM + service account):
+  1. People sign in with Scotia ID + app password against ``dbo.App_Users``
+     (bcrypt hash, IsActive, CanWrite).
+  2. All SQL access uses **Trusted Connection** as the Windows identity of the
+     process — the dedicated **service account** that runs Streamlit on the VM.
+  3. The login Scotia ID is stored in ``Created_By`` / session context ``AppUser``
+     and used for GlobalWorkforceHR (Canada / headcount).
+
+Per-person Windows SQL grants are NOT used for INSERT; write access is controlled
+by ``App_Users.CanWrite`` (and the service account must have INSERT).
 
 Configuration (priority order):
   1. Arguments passed to ``get_connection``.
@@ -12,25 +20,20 @@ Configuration (priority order):
   4. Defaults (``localhost`` / ``Bogota_GBS_NS``).
 """
 
-import getpass
+from __future__ import annotations
+
 import os
 
+import bcrypt
 import pandas as pd
 
 DEFAULT_DATABASE = "Bogota_GBS_NS"
 DEFAULT_SERVER = "localhost"
 
-
-def current_windows_user() -> str:
-    """Return the Windows account name of the person running the app."""
-    return os.environ.get("USERNAME") or getpass.getuser()
-
-
-def current_windows_domain_user() -> str:
-    """Return ``DOMAIN\\user`` when the domain is known, else just the user."""
-    user = current_windows_user()
-    domain = os.environ.get("USERDOMAIN")
-    return f"{domain}\\{user}" if domain else user
+USERS_TABLE = "dbo.App_Users"
+REPORT_TABLE = "dbo.Attendance_Absenteeism_Report"
+HR_TABLE = "[EDDU_ID].[dbo].[GlobalWorkforceHR]"
+WFO_COUNTRY = "Canada"
 
 
 def _read_secret(section: str, key: str) -> str | None:
@@ -63,10 +66,10 @@ def _pick_driver() -> str:
     )
 
 
-def get_connection(server: str | None = None, database: str | None = None):
-    """Open a Windows-authenticated (Trusted Connection) pyodbc connection."""
-    import pyodbc
-
+def _resolve_server_database(
+    server: str | None = None,
+    database: str | None = None,
+) -> tuple[str, str]:
     server = server or _read_secret("sqlserver", "server") or os.environ.get("SQLSERVER_HOST") or DEFAULT_SERVER
     database = (
         database
@@ -74,6 +77,22 @@ def get_connection(server: str | None = None, database: str | None = None):
         or os.environ.get("SQLSERVER_DATABASE")
         or DEFAULT_DATABASE
     )
+    return server, database
+
+
+def get_connection(
+    server: str | None = None,
+    database: str | None = None,
+    app_user: str | None = None,
+):
+    """Open a Trusted Connection as the process identity (service account).
+
+    When ``app_user`` is set, store it in SQL session context as ``AppUser`` for
+    auditing (who signed into the Streamlit app).
+    """
+    import pyodbc
+
+    server, database = _resolve_server_database(server, database)
     driver = _pick_driver()
 
     conn_str = (
@@ -84,20 +103,19 @@ def get_connection(server: str | None = None, database: str | None = None):
         "Encrypt=yes;"
         "TrustServerCertificate=yes;"
     )
-    return pyodbc.connect(conn_str)
+    conn = pyodbc.connect(conn_str)
+    if app_user:
+        cursor = conn.cursor()
+        cursor.execute(
+            "EXEC sp_set_session_context @key = N'AppUser', @value = ?",
+            app_user.strip(),
+        )
+    return conn
 
 
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
-#
-# Single unified table provided by the business:
-#   dbo.Attendance_Absenteeism_Report
-# Absenteeism and WFO are saved as SEPARATE rows. An absenteeism row leaves the
-# WFO columns NULL; a WFO row stores 0 in the NOT NULL absenteeism numeric
-# columns. Report_Date is stored as the Monday of the reported week.
-
-REPORT_TABLE = "dbo.Attendance_Absenteeism_Report"
 
 _CREATE_REPORT = """
 IF OBJECT_ID('dbo.Attendance_Absenteeism_Report', 'U') IS NULL
@@ -127,33 +145,142 @@ CREATE TABLE dbo.Attendance_Absenteeism_Report (
 );
 """
 
-# The business table may already exist without a Created_By column, so add it
-# when missing (only if the login has ALTER permission).
 _ENSURE_CREATED_BY = """
 IF OBJECT_ID('dbo.Attendance_Absenteeism_Report', 'U') IS NOT NULL
    AND COL_LENGTH('dbo.Attendance_Absenteeism_Report', 'Created_By') IS NULL
     ALTER TABLE dbo.Attendance_Absenteeism_Report ADD Created_By VARCHAR(200) NULL;
 """
 
+_CREATE_APP_USERS = """
+IF OBJECT_ID('dbo.App_Users', 'U') IS NULL
+CREATE TABLE dbo.App_Users (
+    Id              INT IDENTITY(1,1) PRIMARY KEY,
+    Username        VARCHAR(100)  NOT NULL,
+    PasswordHash    VARCHAR(255)  NOT NULL,
+    DisplayName     VARCHAR(200)  NULL,
+    CanWrite        BIT           NOT NULL DEFAULT 1,
+    IsActive        BIT           NOT NULL DEFAULT 1,
+    CreatedAt       DATETIME      NOT NULL DEFAULT GETDATE(),
+    CONSTRAINT UQ_App_Users_Username UNIQUE (Username)
+);
+"""
+
+_ENSURE_CAN_WRITE = """
+IF OBJECT_ID('dbo.App_Users', 'U') IS NOT NULL
+   AND COL_LENGTH('dbo.App_Users', 'CanWrite') IS NULL
+    ALTER TABLE dbo.App_Users ADD CanWrite BIT NOT NULL CONSTRAINT DF_App_Users_CanWrite DEFAULT 1;
+"""
+
 
 def init_db(server: str | None = None, database: str | None = None) -> None:
-    """Ensure the report table (and its Created_By column) exists."""
+    """Ensure report + App_Users tables exist (service account Trusted Connection)."""
     conn = get_connection(server=server, database=database)
     try:
         cursor = conn.cursor()
         cursor.execute(_CREATE_REPORT)
         cursor.execute(_ENSURE_CREATED_BY)
+        cursor.execute(_CREATE_APP_USERS)
+        cursor.execute(_ENSURE_CAN_WRITE)
         conn.commit()
     finally:
         conn.close()
 
 
 # ---------------------------------------------------------------------------
-# Headcount / WFO access source: [EDDU_ID].[dbo].[GlobalWorkforceHR]
+# Authentication (app table only; SQL uses service account)
 # ---------------------------------------------------------------------------
 
-HR_TABLE = "[EDDU_ID].[dbo].[GlobalWorkforceHR]"
-WFO_COUNTRY = "Canada"
+def service_account_can_insert(server: str | None = None, database: str | None = None) -> bool:
+    """Return True if the Trusted Connection (service account) can INSERT."""
+    conn = get_connection(server=server, database=database)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT HAS_PERMS_BY_NAME(
+                'dbo.Attendance_Absenteeism_Report',
+                'OBJECT',
+                'INSERT'
+            )
+            """
+        )
+        row = cursor.fetchone()
+        return bool(row and row[0] == 1)
+    finally:
+        conn.close()
+
+
+def verify_app_user(
+    username: str,
+    password: str,
+    server: str | None = None,
+    database: str | None = None,
+) -> dict:
+    """Verify username/password against dbo.App_Users (service account connection)."""
+    username = (username or "").strip()
+    if not username or password is None or password == "":
+        raise ValueError("Username and password are required.")
+
+    conn = get_connection(server=server, database=database, app_user=username)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT Username, PasswordHash, DisplayName, IsActive, CanWrite
+            FROM {USERS_TABLE}
+            WHERE Username = ?
+            """,
+            username,
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise ValueError("Invalid username or password.")
+
+        stored_user, password_hash, display_name, is_active, can_write_flag = row
+        if not is_active:
+            raise ValueError("This account is inactive. Contact an administrator.")
+
+        hash_bytes = (password_hash or "").encode("utf-8")
+        if not bcrypt.checkpw(password.encode("utf-8"), hash_bytes):
+            raise ValueError("Invalid username or password.")
+
+        return {
+            "ok": True,
+            "username": stored_user,
+            "display_name": display_name,
+            "can_write": bool(can_write_flag),
+        }
+    finally:
+        conn.close()
+
+
+def authenticate_user(
+    username: str,
+    password: str,
+    server: str | None = None,
+    database: str | None = None,
+) -> dict:
+    """Validate App_Users and whether this person may save (CanWrite + service INSERT).
+
+    Returns::
+        {
+          "username": str,
+          "display_name": str | None,
+          "can_write": bool,
+        }
+    """
+    app_user = verify_app_user(username, password, server=server, database=database)
+    svc_ok = service_account_can_insert(server=server, database=database)
+    return {
+        "username": app_user["username"],
+        "display_name": app_user.get("display_name"),
+        "can_write": bool(app_user.get("can_write")) and svc_ok,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Headcount / WFO access source: [EDDU_ID].[dbo].[GlobalWorkforceHR]
+# ---------------------------------------------------------------------------
 
 _MANAGER_PROFILE_SQL = f"""
 SELECT TOP 1
@@ -181,23 +308,12 @@ WHERE m.[Scotia ID Confidential] = ?
 
 
 def fetch_manager_profile(
-    scotia_id: str | None = None,
+    scotia_id: str,
     server: str | None = None,
     database: str | None = None,
 ) -> dict:
-    """Look up the signed-in person in GlobalWorkforceHR and derive team info.
-
-    Logic:
-      1. Match ``Scotia ID Confidential`` to the Windows user (Scotia ID).
-      2. If ``Position Title`` LIKE '%Manager%', take their ``Position Code``.
-      3. Count people whose ``Manager Position Code`` equals that code (= team size).
-      4. If ``Country Name`` = 'Canada', the person has WFO access; otherwise
-         they only report Absenteeism.
-
-    Returns a dict with keys: scotia_id, found, is_manager, position_code,
-    position_title, country_name, team_headcount, wfo_allowed, display_name.
-    """
-    scotia_id = (scotia_id or current_windows_user()).strip()
+    """Look up the logged-in Scotia ID in GlobalWorkforceHR and derive team info."""
+    scotia_id = (scotia_id or "").strip()
     empty = {
         "scotia_id": scotia_id,
         "found": False,
@@ -212,7 +328,7 @@ def fetch_manager_profile(
     if not scotia_id:
         return empty
 
-    conn = get_connection(server=server, database=database)
+    conn = get_connection(server=server, database=database, app_user=scotia_id)
     try:
         cursor = conn.cursor()
         cursor.execute(_MANAGER_PROFILE_SQL, scotia_id)
@@ -245,7 +361,7 @@ def fetch_manager_profile(
 
 
 def registered_headcount_for_manager(
-    scotia_id: str | None = None,
+    scotia_id: str,
     server: str | None = None,
     database: str | None = None,
 ) -> int | None:
@@ -276,7 +392,7 @@ def insert_absenteeism(
     database: str | None = None,
 ) -> None:
     """Insert one Absenteeism row (WFO columns left NULL)."""
-    conn = get_connection(server=server, database=database)
+    conn = get_connection(server=server, database=database, app_user=created_by)
     try:
         cursor = conn.cursor()
         cursor.execute(
@@ -308,9 +424,13 @@ def insert_absenteeism(
         conn.close()
 
 
-def fetch_absenteeism(server: str | None = None, database: str | None = None) -> pd.DataFrame:
+def fetch_absenteeism(
+    server: str | None = None,
+    database: str | None = None,
+    app_user: str | None = None,
+) -> pd.DataFrame:
     """Return absenteeism rows (those without WFO data), newest first."""
-    conn = get_connection(server=server, database=database)
+    conn = get_connection(server=server, database=database, app_user=app_user)
     try:
         cursor = conn.cursor()
         cursor.execute(
@@ -338,14 +458,10 @@ def insert_wfo(
     server: str | None = None,
     database: str | None = None,
 ) -> None:
-    """Insert one WFO row.
-
-    The absenteeism numeric columns are NOT NULL in the shared table, so they are
-    stored as 0 for a WFO-only row. Up to five comments map to WFO_Comment1..5.
-    """
+    """Insert one WFO row."""
     comments = comments or []
     padded = [(comments[i] if i < len(comments) else None) for i in range(5)]
-    conn = get_connection(server=server, database=database)
+    conn = get_connection(server=server, database=database, app_user=created_by)
     try:
         cursor = conn.cursor()
         cursor.execute(
@@ -382,9 +498,13 @@ def insert_wfo(
         conn.close()
 
 
-def fetch_wfo(server: str | None = None, database: str | None = None) -> pd.DataFrame:
+def fetch_wfo(
+    server: str | None = None,
+    database: str | None = None,
+    app_user: str | None = None,
+) -> pd.DataFrame:
     """Return WFO rows (those with a WFO flag set), newest first."""
-    conn = get_connection(server=server, database=database)
+    conn = get_connection(server=server, database=database, app_user=app_user)
     try:
         cursor = conn.cursor()
         cursor.execute(

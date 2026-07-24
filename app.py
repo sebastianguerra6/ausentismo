@@ -1,16 +1,14 @@
 """Absenteeism & Work From Office (WFO) tracker.
 
-Two manual-entry modules that both write to a single SQL Server table
-(``dbo.Attendance_Absenteeism_Report``) over a Trusted Connection:
-  1. Absenteeism: Leader, Location, Team, Total Headcount, planned / unplanned
-     approved leave and days impacted, plus comments. Computes the unplanned
-     percentage of the week and (when the source base is available) the
-     headcount alignment percentage.
-  2. Work From Office: whether all required employees attended, how many were
-     non-compliant, and up to five comments.
+Users sign in with Scotia ID + app password (dbo.App_Users). SQL Server access
+uses Trusted Connection as the Windows **service account** that runs the app.
+The login Scotia ID is used for Created_By and GlobalWorkforceHR (Canada /
+headcount). Write access is controlled by App_Users.CanWrite.
 
-Read/write permissions are enforced by SQL Server for the trusted Windows user
-(the account running the app); there is no application-level authorization.
+Modules write to ``dbo.Attendance_Absenteeism_Report``:
+  1. Absenteeism: Leader, Location, Team, Total Headcount, planned / unplanned
+     leave and days impacted, plus comments.
+  2. Work From Office (mandatory when Country Name in HR is Canada).
 """
 
 from datetime import date, timedelta
@@ -130,6 +128,43 @@ def monday_of_week(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
 
+def render_login(server: str | None) -> None:
+    """Show the Scotia ID / app password login form."""
+    st.subheader("Sign in")
+    st.caption(
+        "Enter your Scotia ID and app password. SQL Server uses Trusted Connection "
+        "as the service account; your Scotia ID identifies you for Created_By, HR, "
+        "and write access (CanWrite)."
+    )
+    with st.form("login_form", clear_on_submit=False):
+        username = st.text_input("Scotia ID", key="login_username")
+        password = st.text_input("Password", type="password", key="login_password")
+        submitted = st.form_submit_button("Sign in")
+
+    if submitted:
+        try:
+            result = sqlserver.authenticate_user(
+                username=username.strip(),
+                password=password,
+                server=server,
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not sign in: {exc}")
+            return
+
+        st.session_state["auth_user"] = result["username"]
+        st.session_state["auth_display_name"] = result.get("display_name")
+        st.session_state["can_write"] = bool(result.get("can_write"))
+        for key in list(st.session_state.keys()):
+            if str(key).startswith("hr_profile::"):
+                del st.session_state[key]
+        st.success(f"Signed in as **{result['username']}**.")
+        st.rerun()
+
+
 def render_identity(
     prefix: str,
     *,
@@ -175,17 +210,27 @@ def render_identity(
     return monday_of_week(report_date), leader, location, team, int(total_headcount)
 
 
-def render_report(server: str | None, created_by: str, profile: dict) -> None:
+def render_report(
+    server: str | None,
+    created_by: str,
+    profile: dict,
+    can_write: bool,
+) -> None:
     st.subheader("Weekly report")
     st.caption(
         "Register the team's absenteeism. If your Country Name in HR is Canada, "
         "the WFO section is mandatory and must be filled in the same submission."
     )
 
-    # Permissions and official headcount come from GlobalWorkforceHR.
     registered = profile.get("team_headcount")
     wfo_required = bool(profile.get("wfo_allowed"))
     country = profile.get("country_name")
+
+    if not can_write:
+        st.warning(
+            "Your account cannot save (CanWrite is off, or the service account "
+            "lacks INSERT). You can view the form, but Save is disabled."
+        )
 
     if not profile.get("found"):
         st.warning(
@@ -312,7 +357,6 @@ def render_report(server: str | None, created_by: str, profile: dict) -> None:
         m1.metric("Total days affected", total_days)
         m2.metric("% Unplanned (week)", f"{unplanned_pct:.1f}%")
 
-        # ---- WFO section (mandatory when the location has WFO access) --------
         wfo_answer = None
         wfo_num_unattended = 0
         wfo_comments: list[str] = []
@@ -368,10 +412,16 @@ def render_report(server: str | None, created_by: str, profile: dict) -> None:
                 f"({country or 'unknown'}). Absenteeism only."
             )
 
-        submitted = st.button("Calculate & Save", key="report_submit")
+        submitted = st.button(
+            "Calculate & Save",
+            disabled=not can_write,
+            key="report_submit",
+        )
 
     if submitted:
-        if low_alignment and not headcount_comment.strip():
+        if not can_write:
+            st.error("You do not have permission to write to SQL Server.")
+        elif low_alignment and not headcount_comment.strip():
             st.error(
                 "Please add a comment explaining why the reported people do not "
                 "reach 90% of the registered unit."
@@ -432,7 +482,10 @@ def render_report(server: str | None, created_by: str, profile: dict) -> None:
 def _render_history(fetch_fn, server: str | None) -> None:
     """Show a fetched history table, handling connection errors gracefully."""
     try:
-        df = fetch_fn(server=server)
+        df = fetch_fn(
+            server=server,
+            app_user=st.session_state.get("auth_user"),
+        )
     except Exception as exc:  # noqa: BLE001
         st.info(f"Could not load saved records (check the SQL Server connection): {exc}")
         return
@@ -456,39 +509,61 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    windows_user = sqlserver.current_windows_domain_user()
-    scotia_id = sqlserver.current_windows_user()
     server = st.text_input(
         "SQL Server host",
         value=st.session_state.get("sqlserver_host", ""),
         placeholder="e.g. SQLPRD01 or SQLPRD01\\INSTANCE",
-        help="Windows Authentication is used. Leave empty to use the configured default.",
+        help="Trusted Connection uses the Windows service account running this app.",
     )
     server = server or None
     if server:
         st.session_state["sqlserver_host"] = server
 
-    # Ensure the report table exists. SQL Server enforces the write permission
-    # of the trusted Windows user, so no application-level gating is needed.
     init_error = None
     try:
         sqlserver.init_db(server=server)
     except Exception as exc:  # noqa: BLE001
         init_error = str(exc)
 
-    # Resolve manager / team / WFO access from GlobalWorkforceHR using Scotia ID.
-    profile_key = f"hr_profile::{server}::{scotia_id}"
+    if init_error:
+        st.warning(f"Could not verify/create tables in SQL Server: {init_error}")
+
+    auth_user = st.session_state.get("auth_user")
+    if not auth_user:
+        render_login(server)
+        return
+
+    can_write = bool(st.session_state.get("can_write"))
+    display_name = st.session_state.get("auth_display_name")
+
+    top_l, top_r = st.columns([4, 1])
+    with top_l:
+        label = f"{display_name} ({auth_user})" if display_name else auth_user
+        st.info(
+            f"Signed in as: **{label}** · "
+            f"{'Write enabled' if can_write else 'Read-only'}"
+        )
+    with top_r:
+        if st.button("Log out", key="logout"):
+            for key in ("auth_user", "auth_display_name", "can_write"):
+                st.session_state.pop(key, None)
+            for key in list(st.session_state.keys()):
+                if str(key).startswith("hr_profile::"):
+                    del st.session_state[key]
+            st.rerun()
+
+    profile_key = f"hr_profile::{server}::{auth_user}"
     profile_error = None
     if profile_key not in st.session_state:
         try:
             st.session_state[profile_key] = sqlserver.fetch_manager_profile(
-                scotia_id=scotia_id,
+                scotia_id=auth_user,
                 server=server,
             )
         except Exception as exc:  # noqa: BLE001
             profile_error = str(exc)
             st.session_state[profile_key] = {
-                "scotia_id": scotia_id,
+                "scotia_id": auth_user,
                 "found": False,
                 "is_manager": False,
                 "position_code": None,
@@ -500,15 +575,12 @@ def main() -> None:
             }
     profile = st.session_state[profile_key]
 
-    st.info(f"Signed in as (Windows user): **{windows_user}** · Scotia ID: **{scotia_id}**")
-    if init_error:
-        st.warning(f"Could not verify/create the table in SQL Server: {init_error}")
     if profile_error:
         st.warning(
             f"Could not read GlobalWorkforceHR (headcount / WFO access): {profile_error}"
         )
 
-    render_report(server, windows_user, profile)
+    render_report(server, auth_user, profile, can_write)
 
 
 if __name__ == "__main__":
